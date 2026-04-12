@@ -13,6 +13,9 @@ import os from "os";
 
 const execFileAsync = promisify(execFile);
 
+const POLYCR_URL = process.env.POLYCR_URL || 'http://192.168.1.11:8000';
+const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
+
 // Helper: derive default output path from input path
 function defaultOutputPath(filePath) {
   const dir = path.dirname(filePath);
@@ -56,7 +59,7 @@ async function runLocalTesseract(filePath) {
 }
 
 // Why: Sends an image to the polycr multi-engine OCR service with a timeout guard.
-// What: POSTs multipart/form-data to http://192.168.1.11:8000/ocr/raw with a 5s AbortController timeout.
+// What: POSTs multipart/form-data to POLYCR_URL/ocr/raw with a 30s AbortController timeout.
 // Test: Mock fetch to return a valid engine response; assert result is non-null and fallback_reason is null.
 async function callPolycr(filePath) {
   const fileBytes = fs.readFileSync(filePath);
@@ -75,9 +78,10 @@ async function callPolycr(filePath) {
   const form = new FormData();
   form.append("file", blob, path.basename(filePath));
   const ac = new AbortController();
+  // 30s timeout
   const timer = setTimeout(() => ac.abort(), 30000);
   try {
-    const resp = await fetch("http://192.168.1.11:8000/ocr/raw", {
+    const resp = await fetch(`${POLYCR_URL}/ocr/raw`, {
       method: "POST",
       body: form,
       signal: ac.signal,
@@ -93,7 +97,7 @@ async function callPolycr(filePath) {
     return {
       result: null,
       fallback_reason: isTimeout
-        ? "polycr timeout (5s)"
+        ? "polycr timeout (30s)"
         : `polycr unreachable: ${err.message}`,
     };
   }
@@ -110,14 +114,16 @@ function pickBestPolycr(data) {
   for (const result of results) {
     if (!result || typeof result.text !== "string" || result.error) continue;
     const wc = countWords(result.text);
-    const conf = typeof result.confidence === "number" ? result.confidence : 0;
+    // polycr confidence is 0–100 integer percent; normalize to 0–1
+    const rawConf = typeof result.confidence === "number" ? result.confidence : 0;
+    const conf = rawConf / 100;
     const score = wc * 1000 + conf;
     if (score > bestScore) {
       bestScore = score;
       best = {
         engine_used: result.engine,
         text: result.text,
-        confidence: result.confidence,
+        confidence: conf,
       };
     }
   }
@@ -372,6 +378,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["file_path"],
       },
     },
+    {
+      name: "scan_document",
+      description:
+        "Scan a document from the HP OfficeJet 5740 using scanimage. Uses SCANNER_DEVICE env var (default escl:http://192.168.1.183:8080). Returns success, path, resolution, mode, and source on success.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          output_path: {
+            type: "string",
+            description: "Output file path (e.g. /tmp/scan.jpg)",
+          },
+          resolution: {
+            type: "number",
+            description: "DPI resolution (default 300)",
+          },
+          mode: {
+            type: "string",
+            enum: ["Color", "Gray"],
+            description: "Color or grayscale (default Color)",
+          },
+          source: {
+            type: "string",
+            enum: ["Flatbed", "ADF"],
+            description: "Flatbed platen or ADF feeder (default Flatbed)",
+          },
+        },
+        required: ["output_path"],
+      },
+    },
   ],
 }));
 
@@ -391,9 +426,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (preprocess) {
       const ext = path.extname(file_path) || ".jpg";
       tempFile = path.join(os.tmpdir(), `ocr_preprocess_${Date.now()}${ext}`);
-      execSync(
-        `convert -auto-orient -colorspace gray -normalize -sharpen 0x1 ${JSON.stringify(file_path)} ${JSON.stringify(tempFile)}`
-      );
+      try {
+        execSync(
+          `convert -auto-orient -colorspace gray -normalize -sharpen 0x1 ${JSON.stringify(file_path)} ${JSON.stringify(tempFile)}`
+        );
+      } catch (e) {
+        throw new Error(`ImageMagick failed: ${e.message}`);
+      }
       targetPath = tempFile;
     }
 
@@ -463,9 +502,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     );
 
     try {
-      execSync(
-        `convert -auto-orient ${JSON.stringify(file_path)} ${JSON.stringify(tempFile)}`
-      );
+      try {
+        execSync(
+          `convert -auto-orient ${JSON.stringify(file_path)} ${JSON.stringify(tempFile)}`
+        );
+      } catch (e) {
+        throw new Error(`ImageMagick failed: ${e.message}`);
+      }
       const ocrResult = await ocrWithFallback(tempFile);
       const { likely_document_type, document_signals } = classifyDocument(
         ocrResult.text
@@ -637,15 +680,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (useTmp) {
       const ext = path.extname(file_path) || ".jpg";
       const tmp = path.join(os.tmpdir(), `rotate_tmp_${Date.now()}${ext}`);
-      execSync(
-        `convert -rotate ${degrees} ${JSON.stringify(file_path)} ${JSON.stringify(tmp)}`
-      );
+      try {
+        execSync(
+          `convert -rotate ${degrees} ${JSON.stringify(file_path)} ${JSON.stringify(tmp)}`
+        );
+      } catch (e) {
+        throw new Error(`ImageMagick failed: ${e.message}`);
+      }
       fs.renameSync(tmp, file_path);
       outPath = file_path;
     } else {
-      execSync(
-        `convert -rotate ${degrees} ${JSON.stringify(file_path)} ${JSON.stringify(outPath)}`
-      );
+      try {
+        execSync(
+          `convert -rotate ${degrees} ${JSON.stringify(file_path)} ${JSON.stringify(outPath)}`
+        );
+      } catch (e) {
+        throw new Error(`ImageMagick failed: ${e.message}`);
+      }
     }
 
     return {
@@ -661,9 +712,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     const outPath = output_path || defaultOutputPath(file_path);
-    execSync(
-      `convert -auto-orient ${JSON.stringify(file_path)} ${JSON.stringify(outPath)}`
-    );
+    try {
+      execSync(
+        `convert -auto-orient ${JSON.stringify(file_path)} ${JSON.stringify(outPath)}`
+      );
+    } catch (e) {
+      throw new Error(`ImageMagick failed: ${e.message}`);
+    }
 
     return {
       content: [{ type: "text", text: outPath }],
@@ -678,12 +733,72 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     const outPath = output_path || defaultOutputPath(file_path);
-    execSync(
-      `convert -auto-orient -colorspace gray -normalize -sharpen 0x1 ${JSON.stringify(file_path)} ${JSON.stringify(outPath)}`
-    );
+    try {
+      execSync(
+        `convert -auto-orient -colorspace gray -normalize -sharpen 0x1 ${JSON.stringify(file_path)} ${JSON.stringify(outPath)}`
+      );
+    } catch (e) {
+      throw new Error(`ImageMagick failed: ${e.message}`);
+    }
 
     return {
       content: [{ type: "text", text: outPath }],
+    };
+  }
+
+  if (name === "scan_document") {
+    const {
+      output_path,
+      resolution = 300,
+      mode = "Color",
+      source = "Flatbed",
+    } = args;
+
+    if (!output_path || typeof output_path !== "string") {
+      throw new Error("output_path must be a non-empty string");
+    }
+
+    // Infer scanimage format from file extension
+    const ext = path.extname(output_path).toLowerCase();
+    let format;
+    if (ext === ".jpg" || ext === ".jpeg") {
+      format = "jpeg";
+    } else if (ext === ".pdf") {
+      format = "pdf";
+    } else if (ext === ".png") {
+      format = "png";
+    } else {
+      format = "jpeg";
+    }
+
+    try {
+      execSync(
+        `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=${format} --output-file=${JSON.stringify(output_path)} --resolution=${resolution} --mode=${JSON.stringify(mode)} --source=${JSON.stringify(source)}`
+      );
+    } catch (e) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ success: false, error: e.message }),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            path: output_path,
+            resolution,
+            mode,
+            source,
+          }),
+        },
+      ],
     };
   }
 
