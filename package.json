@@ -1,0 +1,16 @@
+{
+  "name": "ocr-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for OCR — multi-engine via polycr (tesseract/easyocr/doctr) with local Tesseract fallback, image preprocessing, and event detail extraction",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "david-gutowsky",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "type": "module"
+}
