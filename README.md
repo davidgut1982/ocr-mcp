@@ -66,6 +66,10 @@ scanimage --device-name="escl:http://192.168.1.183:8080" \
    }
    ```
 
+## Related
+
+- [polycr](https://github.com/davidgut1982/polycr) — the multi-engine OCR backend this server calls for `ocr__ocr_image_polycr` and `ocr__extract_event_details`
+
 ## Documentation
 
 The `docs/workflows.md` file contains full workflow documentation for OpenClaw/SOUL.md integration, including how the OCR tools are composed into higher-level assistant behaviors.
