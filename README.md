@@ -24,6 +24,27 @@ An MCP (Model Context Protocol) server for OCR. Exposes 8 tools via the `@modelc
   ```
 - **polycr stack** (optional, for multi-engine OCR): a running instance of the polycr HTTP service. Default endpoint is `http://192.168.1.11:8000`. If unavailable, tools that use polycr fall back to local Tesseract.
 
+## Locally Installed Software
+
+These packages are installed on the host machine and used directly by this server:
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `tesseract-ocr` | 5.5.0 | Local OCR engine — used by `ocr__ocr_image_local` and as polycr fallback |
+| `sane-utils` | 1.3.1 | `scanimage` CLI — scanner access layer (SANE) |
+| `sane-airscan` | 0.99.35 | eSCL/AirScan backend — enables network scanning from HP and other AirScan-compatible scanners |
+| `imagemagick` | 7.1.1.43 | Image preprocessing — used by `ocr__enhance_image_for_ocr`, `ocr__rotate_image`, `ocr__auto_orient_image` |
+
+**Scanner configuration (HP OfficeJet 5740):**
+```bash
+# Device string for scanimage
+escl:http://192.168.1.183:8080
+
+# Basic flatbed scan
+scanimage --device-name="escl:http://192.168.1.183:8080" \
+  --format=jpeg --output-file=/tmp/scan.jpg --resolution=300
+```
+
 ## Setup
 
 1. Install dependencies:
