@@ -1,5 +1,7 @@
 # OCR MCP — Workflows & Full Tool Reference
 
+> **Use `ocr__scan_and_file` for all scanning.** It executes the full pipeline atomically in one call, preventing context bootstrap interruptions.
+
 ## Scanning Pipeline Architecture
 
 ```

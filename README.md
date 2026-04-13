@@ -22,6 +22,7 @@ Both polycr and ocrmypdf run as Docker Compose services on the OCR host (default
 
 | Tool | Description |
 |------|-------------|
+| `ocr__scan_and_file` | **Atomic pipeline**: scan → OCR → searchable PDF → upload to Nextcloud in a single call. Use this for all document scanning. |
 | `ocr__scan_document` | Scan from the HP OfficeJet 5740 (flatbed or ADF) at 300 DPI. |
 | `ocr__create_searchable_pdf` | Convert a scanned image to a searchable PDF via the ocrmypdf service (port 8001). Falls back to local Tesseract if the service is unreachable. |
 | `ocr__ocr_image_polycr` | Multi-engine OCR via the polycr stack (tesseract/easyocr/doctr) running on a remote host (default: `http://192.168.1.11:8000`). Falls back to local Tesseract if the polycr endpoint is unreachable. |

@@ -18,6 +18,11 @@ const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
 const POLYCR_PDF_URL = `http://${POLYCR_HOST}:8001`;
 const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
 
+const NEXTCLOUD_URL = process.env.NEXTCLOUD_URL || 'https://nextcloud.shifting-ground.link';
+const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER || 'david.gutowsky';
+const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD || '';
+const NEXTCLOUD_WEBDAV_BASE = `${NEXTCLOUD_URL}/remote.php/dav/files/${NEXTCLOUD_USER}`;
+
 // Helper: derive default output path from input path
 function defaultOutputPath(filePath) {
   const dir = path.dirname(filePath);
@@ -222,6 +227,123 @@ function classifyDocument(text) {
   const likely = signals.length > 0 ? signals[0].type : "unknown";
   return { likely_document_type: likely, document_signals: signals };
 }
+
+// --- ocr__scan_and_file helpers ---
+
+// Why: Maps profile names to scanimage parameters so the atomic pipeline tool
+//      doesn't need a large switch statement at call-site.
+// What: Returns { mode, source, format } for a given profile string.
+// Test: Assert PROFILE_PARAMS['doc-bw'].mode === 'Gray' and PROFILE_PARAMS['photo'].mode === 'Color'.
+const PROFILE_PARAMS = {
+  'doc-bw':     { mode: 'Gray',  source: 'Flatbed', format: 'jpeg' },
+  'doc-bw-adf': { mode: 'Gray',  source: 'ADF',     format: 'jpeg' },
+  'doc-color':  { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
+  'receipt':    { mode: 'Gray',  source: 'Flatbed', format: 'jpeg' },
+  'id-card':    { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
+  'photo':      { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
+  'event':      { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
+};
+
+// Why: Centralizes filing classification so the atomic pipeline tool routes each
+//      document to the correct Nextcloud folder without caller logic.
+// What: Scores OCR text and profile/description against keyword patterns; returns
+//       { type, path } where path is the Nextcloud subdirectory (or null for event).
+// Test: Call with profile='receipt', assert path === '/Personal/Financial/Receipts/'.
+//       Call with text containing "prescription", assert type === 'medical'.
+function classifyDocumentForFiling(text, profile, description) {
+  const lower = (text + ' ' + (description || '')).toLowerCase();
+
+  if (profile === 'receipt')  return { type: 'receipt',       path: '/Personal/Financial/Receipts/' };
+  if (profile === 'photo')    return { type: 'photo',         path: '/Media/Photos/' };
+  if (profile === 'event')    return { type: 'event',         path: null };
+  if (profile === 'id-card') {
+    if (lower.match(/insurance|coverage|member/)) return { type: 'insurance-card', path: '/Personal/Insurance/' };
+    if (lower.match(/latvia|latvian/))            return { type: 'latvian-id',     path: '/Personal/Identity/Latvian-Citizenship/' };
+    return { type: 'id', path: '/Personal/Identity/' };
+  }
+
+  if (lower.match(/invoice|receipt|total\s*\$|subtotal|thank you for your (purchase|order)/))
+    return { type: 'receipt',   path: '/Personal/Financial/Receipts/' };
+  if (lower.match(/prescription|diagnosis|patient|physician|hospital|lab result|immunization/))
+    return { type: 'medical',   path: '/Personal/Health/Medical/' };
+  if (lower.match(/insurance|policy number|coverage|premium|claim number/))
+    return { type: 'insurance', path: '/Personal/Insurance/' };
+  if (lower.match(/\b(irs|1099|w-2|w2|tax return|adjusted gross|refund)\b/))
+    return { type: 'tax',       path: '/Personal/Financial/Taxes/' };
+  if (lower.match(/attorney|court|legal|plaintiff|defendant|judgment|hereby/))
+    return { type: 'legal',     path: '/Personal/Legal/' };
+  if (lower.match(/lease|landlord|tenant|rental agreement|property/))
+    return { type: 'housing',   path: '/Personal/Housing/' };
+  if (lower.match(/vehicle|registration|title|dmv|vin\b/))
+    return { type: 'auto',      path: '/Personal/Auto/' };
+  if (lower.match(/theodore|teddy|daycare|preschool/))
+    return { type: 'theodore',  path: '/Personal/Theodore/' };
+  if (lower.match(/mortgage|loan statement|student loan/))
+    return { type: 'financial', path: '/Personal/Financial/' };
+
+  return { type: 'document', path: '/Inbox/' };
+}
+
+// Why: Produces consistent, date-prefixed filenames from OCR text so documents are
+//      sortable by date without manual renaming.
+// What: Extracts first recognizable date from text (ISO, US, or long-form month);
+//       falls back to today. Appends a sanitized slug from description or type.
+// Test: Call with text="January 5, 2026" description="verizon bill" ext="pdf";
+//       assert result === "2026-01-05_verizon-bill.pdf".
+function generateFilename(text, classification, description, ext) {
+  const months = {
+    january:'01', february:'02', march:'03',    april:'04',
+    may:'05',     june:'06',     july:'07',      august:'08',
+    september:'09', october:'10', november:'11', december:'12',
+  };
+
+  let dateStr = null;
+  const m1 = text.match(/\b(\d{4})[\/\-](\d{2})[\/\-](\d{2})\b/);
+  const m2 = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
+  const m3 = text.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})\b/i);
+
+  if (m1)      dateStr = `${m1[1]}-${m1[2].padStart(2,'0')}-${m1[3].padStart(2,'0')}`;
+  else if (m2) dateStr = `${m2[3]}-${m2[1].padStart(2,'0')}-${m2[2].padStart(2,'0')}`;
+  else if (m3) dateStr = `${m3[3]}-${months[m3[1].toLowerCase()]}-${m3[2].padStart(2,'0')}`;
+  else         dateStr = new Date().toISOString().split('T')[0];
+
+  let slug = description || classification.type;
+  slug = slug.toLowerCase().trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9\-]/g, '')
+    .replace(/-+/g, '-')
+    .slice(0, 40);
+
+  return `${dateStr}_${slug}.${ext}`;
+}
+
+// Why: Encapsulates the WebDAV PUT flow so the atomic pipeline handler stays readable.
+// What: Ensures the target directory exists via MKCOL (ignores 405 = already exists),
+//       then uploads localPath as filename into nextcloudPath. Returns the final URL.
+// Test: Mock fetch; assert MKCOL is called before PUT and PUT uses Basic auth header.
+async function nextcloudUpload(localPath, nextcloudPath, filename) {
+  const fileBuffer = fs.readFileSync(localPath);
+  const url = `${NEXTCLOUD_WEBDAV_BASE}${nextcloudPath}${encodeURIComponent(filename)}`;
+  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
+
+  // MKCOL is safe to call even when directory already exists (server returns 405).
+  await fetch(`${NEXTCLOUD_WEBDAV_BASE}${nextcloudPath}`, {
+    method: 'MKCOL',
+    headers: { Authorization: auth },
+  }).catch(() => {});
+
+  const contentType = localPath.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg';
+  const resp = await fetch(url, {
+    method: 'PUT',
+    headers: { Authorization: auth, 'Content-Type': contentType },
+    body: fileBuffer,
+  });
+
+  if (!resp.ok) throw new Error(`Nextcloud upload failed: HTTP ${resp.status}`);
+  return url;
+}
+
+// --- end ocr__scan_and_file helpers ---
 
 const server = new Server(
   { name: "ocr-mcp", version: "1.2.0" },
@@ -430,6 +552,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["image_path"],
+      },
+    },
+    {
+      name: "ocr__scan_and_file",
+      description:
+        "Atomic pipeline: scan document → OCR → create searchable PDF → upload to Nextcloud. Executes the full pipeline in one call. Returns what was scanned, filename used, and where it was filed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          profile: {
+            type: "string",
+            enum: ["doc-bw", "doc-bw-adf", "doc-color", "receipt", "id-card", "photo", "event"],
+            description: "Scanning profile to use",
+          },
+          description: {
+            type: "string",
+            description: "Optional hint for filename/classification (e.g. 'verizon bill', 'theodore immunization')",
+          },
+          nextcloud_path: {
+            type: "string",
+            description: "Override auto-classified Nextcloud path (e.g. /Personal/Legal/). Include trailing slash.",
+          },
+          filename: {
+            type: "string",
+            description: "Override auto-generated filename (e.g. 2026-04-13_verizon-bill.pdf)",
+          },
+        },
+        required: ["profile"],
       },
     },
   ],
@@ -920,6 +1070,145 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `ocrmypdf service failed (${fallbackReason}) and local tesseract fallback also failed: ${localErr.message}`
         );
       }
+    }
+  }
+
+  if (name === "ocr__scan_and_file") {
+    // Why: Executes the full scan→OCR→PDF→upload pipeline atomically so a context
+    //      bootstrap reset cannot interrupt it between steps.
+    // What: Scans via scanimage, OCRs via polycr (Tesseract fallback), creates a
+    //       searchable PDF via ocrmypdf service (Tesseract fallback), uploads to
+    //       Nextcloud WebDAV, cleans up temp files, returns a summary object.
+    // Test: Mock execSync for scanimage success; mock fetch for polycr and ocrmypdf;
+    //       assert result.success is true, result.filed_at is non-null, and temp
+    //       files are deleted by the end of the call.
+    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride } = args;
+    const params = PROFILE_PARAMS[profile];
+    if (!params) throw new Error(`Unknown profile: ${profile}`);
+
+    const timestamp = Date.now();
+    const tmpJpeg = `/tmp/scan_${timestamp}.jpg`;
+    const tmpPdf  = `/tmp/scan_${timestamp}.pdf`;
+
+    try {
+      // Step 1: Scan
+      execSync(
+        `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
+        { timeout: 60000 }
+      );
+
+      // Step 2: OCR (skip for photo profile)
+      let ocrText = '';
+      let wordCount = 0;
+      let confidence = 0;
+
+      if (profile !== 'photo') {
+        const ocrResult = await ocrWithFallback(tmpJpeg);
+        ocrText = ocrResult.text || '';
+        wordCount = ocrResult.word_count || 0;
+        confidence = ocrResult.confidence || 0;
+
+        // Low-confidence retry with image enhancement
+        if (wordCount < 10) {
+          const enhanced = `/tmp/scan_${timestamp}_enhanced.jpg`;
+          try {
+            execSync(`convert ${JSON.stringify(tmpJpeg)} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
+            const enhancedResult = await ocrWithFallback(enhanced);
+            if ((enhancedResult.word_count || 0) > wordCount) {
+              ocrText = enhancedResult.text || '';
+              wordCount = enhancedResult.word_count || 0;
+              confidence = enhancedResult.confidence || 0;
+            }
+          } catch (_) {
+            // enhancement failed — keep original OCR result
+          } finally {
+            try { execSync(`rm -f ${JSON.stringify(enhanced)}`); } catch (_) {}
+          }
+        }
+      }
+
+      // Step 3: Classify + generate filename
+      const classification = classifyDocumentForFiling(ocrText, profile, description);
+      const ext = profile === 'photo' ? 'jpg' : 'pdf';
+      const filename = filenameOverride || generateFilename(ocrText, classification, description || '', ext);
+      const ncPath = ncPathOverride || classification.path;
+
+      // Step 4: Create searchable PDF (skip for photo and event)
+      let fileToUpload = tmpJpeg;
+      if (profile !== 'photo' && profile !== 'event') {
+        try {
+          const fileBytes = fs.readFileSync(tmpJpeg);
+          const blob = new Blob([fileBytes], { type: 'image/jpeg' });
+          const form = new FormData();
+          form.append('file', blob, 'scan.jpg');
+          const params2 = new URLSearchParams({ deskew: 'true', optimize: '1' });
+          const ac = new AbortController();
+          const timer = setTimeout(() => ac.abort(), 60000);
+          let pdfResp;
+          try {
+            pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${params2}`, {
+              method: 'POST',
+              body: form,
+              signal: ac.signal,
+            });
+          } finally {
+            clearTimeout(timer);
+          }
+          if (pdfResp.ok) {
+            const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
+            fs.writeFileSync(tmpPdf, pdfBuf);
+            fileToUpload = tmpPdf;
+          } else {
+            throw new Error(`ocrmypdf service HTTP ${pdfResp.status}`);
+          }
+        } catch (_) {
+          // Fallback: local tesseract PDF mode
+          try {
+            const outStem = tmpPdf.replace('.pdf', '');
+            await execFileAsync('tesseract', [tmpJpeg, outStem, 'pdf']);
+            fileToUpload = tmpPdf;
+          } catch (localErr) {
+            // If PDF creation entirely fails, upload the JPEG instead
+            fileToUpload = tmpJpeg;
+          }
+        }
+      }
+
+      // Step 5: Upload to Nextcloud (skip for event profile)
+      let uploadUrl = null;
+      if (profile !== 'event' && ncPath) {
+        uploadUrl = await nextcloudUpload(fileToUpload, ncPath, filename);
+      }
+
+      // Step 6: Cleanup temp files
+      try { execSync(`rm -f ${JSON.stringify(tmpJpeg)} ${JSON.stringify(tmpPdf)}`); } catch (_) {}
+
+      // Step 7: Return result
+      const result = {
+        success: true,
+        profile,
+        filename,
+        nextcloud_path: ncPath,
+        filed_at: ncPath ? `${ncPath}${filename}` : null,
+        document_type: classification.type,
+        word_count: wordCount,
+        confidence: Math.round(confidence * 100) / 100,
+        ocr_preview: ocrText.slice(0, 300).trim() || null,
+      };
+
+      if (profile === 'event') {
+        result.note = 'Event profile — use ocr__extract_event_details for calendar creation instead.';
+        result.raw_text = ocrText;
+      }
+
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+
+    } catch (err) {
+      try { execSync(`rm -f ${JSON.stringify(tmpJpeg)} ${JSON.stringify(tmpPdf)}`); } catch (_) {}
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: false, error: err.message }) }],
+        isError: true,
+      };
     }
   }
 
