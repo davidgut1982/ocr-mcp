@@ -1,6 +1,9 @@
 # Deployment Guide
 
-Combined deployment guide for the polycr + ocr-mcp stack. polycr runs on the dedicated OCR host; ocr-mcp runs on the assistant host alongside OpenClaw.
+Combined deployment guide for the polycr + ocrmypdf + ocr-mcp stack.
+
+- **polycr** (port 8000) and **ocrmypdf** (port 8001) run on the dedicated OCR host (192.168.1.11) as Docker Compose services.
+- **ocr-mcp** runs on the assistant host alongside OpenClaw.
 
 ---
 
@@ -50,13 +53,18 @@ docker compose up -d
 docker compose logs -f
 ```
 
-Verify polycr is running:
+Verify both services are running:
 ```bash
 curl http://192.168.1.11:8000/health
 # Expected: {"status":"ok","engines":["tesseract","easyocr","doctr"]}
+
+curl http://192.168.1.11:8001/health
+# Expected: {"status":"ok","service":"ocrmypdf"}
 ```
 
-If the health check returns a non-200 response or connection is refused, check `docker compose ps` and `docker compose logs router` on the OCR host before proceeding.
+If the health check returns a non-200 response or connection is refused, check `docker compose ps` and `docker compose logs` on the OCR host before proceeding.
+
+The ocrmypdf service runs on port 8001 alongside polycr on port 8000. Both are started by `docker compose up -d` from the polycr repository root.
 
 ---
 
@@ -135,7 +143,8 @@ If `ocr__ocr_image_polycr` returns results sourced only from tesseract, polycr i
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POLYCR_URL` | `http://192.168.1.11:8000` | Base URL of the polycr REST API |
+| `POLYCR_HOST` | `192.168.1.11` | IP/hostname of the OCR host; used to derive both service URLs |
+| `POLYCR_URL` | `http://<POLYCR_HOST>:8000` | Base URL of the polycr text extraction API (overrides POLYCR_HOST if set) |
 | `SCANNER_DEVICE` | `escl:http://192.168.1.183:8080` | SANE device string passed to `scanimage` |
 
 ---

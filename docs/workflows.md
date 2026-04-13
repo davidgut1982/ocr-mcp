@@ -1,5 +1,61 @@
 # OCR MCP — Workflows & Full Tool Reference
 
+## Scanning Pipeline Architecture
+
+```
+scan_document (ocr-mcp on openclaw host) → JPEG temp file
+    ↓
+polycr :8000/ocr/raw → multi-engine text extraction
+    (purpose: document classification + filename generation)
+    ↓
+ocrmypdf-service :8001/pdf → searchable PDF with embedded text layer
+    (purpose: archival document with copy/search capability)
+    ↓
+Upload to Nextcloud via WebDAV
+    ↓
+Delete temp files
+```
+
+Three services participate in every document scan:
+
+| Service | Host | Port | Role |
+|---------|------|------|------|
+| ocr-mcp | openclaw (192.168.1.x) | stdio | MCP server; drives the pipeline |
+| polycr router | 192.168.1.11 | 8000 | Multi-engine OCR for text extraction |
+| ocrmypdf | 192.168.1.11 | 8001 | Searchable PDF generation for archival |
+
+---
+
+## Scanning Profiles
+
+Scanner: HP OfficeJet 5740 at `escl:http://192.168.1.183:8080` — 300 DPI, no duplex.
+
+| Profile | Mode | Source | Format | OCR | Use case |
+|---------|------|--------|--------|-----|----------|
+| `doc-bw` | Gray | Flatbed | PDF | Yes | Single-page letters, forms, contracts |
+| `doc-bw-adf` | Gray | ADF | PDF | Yes | Multi-page B/W via feeder |
+| `doc-color` | Color | Flatbed | PDF | Yes | Color forms, certificates |
+| `receipt` | Gray | Flatbed | PDF | Yes + structured extraction | Receipts, invoices |
+| `id-card` | Color | Flatbed | PDF | Yes | IDs, insurance cards, wallet items |
+| `photo` | Color | Flatbed | JPEG | No | Photos, artwork |
+| `event` | Color | Flatbed | — | extract_event_details → calendar | Invites, flyers |
+
+---
+
+## Filename Convention
+
+Format: `YYYY-MM-DD_description.pdf`
+
+- Date: extracted from document content if present, otherwise use scan date.
+- Description: auto-generated from OCR text (2–5 word summary, lowercase-hyphenated).
+
+Examples:
+- `2026-03-15_att-phone-bill.pdf`
+- `2026-04-01_state-farm-renewal.pdf`
+- `2026-04-13_scan.pdf` (fallback when content is not extractable)
+
+---
+
 ## Tool Reference
 
 | Tool | Use Case | Returns |
@@ -67,21 +123,46 @@ If `empty: true` or `word_count < 10` after `ocr_image_polycr`:
 
 ---
 
-## Workflow: Document → Nextcloud Filing
+## Workflow: Document Scanning → Nextcloud Filing
 
-When David scans a document to file it:
-1. OCR with `ocr__ocr_image_polycr`
-2. Classify document type from text (receipt, contract, medical, insurance, invoice, etc.)
-3. Ask David where to file if classification is ambiguous — location depends on type
-4. Upload to appropriate Nextcloud folder
-5. Filename: `YYYY-MM-DD_document-description.pdf`
+Full end-to-end flow when David scans a document for archival:
 
-Common filing locations (confirm with David for new categories):
-- Receipts → `/Documents/Receipts/YYYY/`
-- Medical → `/Documents/Medical/`
-- Insurance → `/Documents/Insurance/`
-- Contracts/Legal → `/Documents/Legal/`
-- Financial → `/Documents/Financial/`
+**Step 1 — Scan**
+Call `ocr__scan_document` with appropriate mode and source. Save to a temp path (e.g. `/tmp/scan_<timestamp>.jpg`).
+
+**Step 2 — Extract text for classification**
+Call `ocr__ocr_image_polycr` on the scanned file. Use the returned text to:
+- Classify the document type (receipt, medical, insurance, legal, tax, identity, housing, auto, etc.)
+- Extract a date (prefer date found in document content over scan date)
+- Generate a short description (2–5 words, lowercase-hyphenated)
+
+**Step 3 — Generate searchable PDF**
+Call `ocr__create_searchable_pdf` on the scanned file. This produces a PDF with an embedded text layer at the same path with a `.pdf` extension.
+
+**Step 4 — Determine Nextcloud filing location**
+
+| Document type | Nextcloud path |
+|---------------|---------------|
+| Receipts, invoices | `/Personal/Financial/Receipts/` |
+| Tax documents | `/Personal/Financial/Taxes/` |
+| Medical records | `/Personal/Health/Medical/` |
+| Insurance documents | `/Personal/Insurance/` |
+| Legal / contracts | `/Personal/Legal/` |
+| Identity documents | `/Personal/Identity/` |
+| Theodore (child docs) | `/Personal/Theodore/` |
+| Housing | `/Personal/Housing/` |
+| Auto | `/Personal/Auto/` |
+| Photos | `/Media/Photos/` |
+| Unknown / ambiguous | `/Inbox/` |
+
+If classification is ambiguous, ask David before filing.
+
+**Step 5 — Upload**
+Upload the PDF to the determined Nextcloud path via WebDAV.
+Filename: `YYYY-MM-DD_description.pdf` (see Filename Convention section above).
+
+**Step 6 — Cleanup**
+Delete the temp JPEG and any intermediate files.
 
 ---
 

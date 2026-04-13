@@ -13,7 +13,9 @@ import os from "os";
 
 const execFileAsync = promisify(execFile);
 
-const POLYCR_URL = process.env.POLYCR_URL || 'http://192.168.1.11:8000';
+const POLYCR_HOST = process.env.POLYCR_HOST || '192.168.1.11';
+const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
+const POLYCR_PDF_URL = `http://${POLYCR_HOST}:8001`;
 const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
 
 // Helper: derive default output path from input path
@@ -405,6 +407,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["output_path"],
+      },
+    },
+    {
+      name: "create_searchable_pdf",
+      description:
+        "Convert an image (or existing PDF) into a searchable PDF with an embedded text layer by sending it to the ocrmypdf service on the polycr host (port 8001). Falls back to local `tesseract ... pdf` if the service is unreachable. Returns the output PDF path and file size.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          image_path: {
+            type: "string",
+            description: "Absolute path to the input image or PDF file",
+          },
+          deskew: {
+            type: "boolean",
+            description: "Deskew the input before OCR (default true)",
+          },
+          optimize: {
+            type: "number",
+            description: "PDF optimization level 0–3 (default 1)",
+          },
+        },
+        required: ["image_path"],
       },
     },
   ],
@@ -800,6 +825,102 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         },
       ],
     };
+  }
+
+  if (name === "create_searchable_pdf") {
+    // Why: Produces an archival searchable PDF by delegating to the ocrmypdf service
+    //      running alongside polycr, with a local Tesseract fallback for resilience.
+    // What: POSTs the file to POLYCR_PDF_URL/pdf, saves the returned PDF next to the
+    //       input file (same directory, .pdf extension), and returns path + size_bytes.
+    //       Falls back to `tesseract <input> <stem> pdf` if the service is unreachable.
+    // Test: Mock fetch to return a PDF buffer; assert pdf_path ends in .pdf and size_bytes > 0.
+    //       Mock fetch to throw; assert fallback_reason is set and pdf_path still exists.
+    const { image_path, deskew = true, optimize = 1 } = args;
+
+    if (!image_path || typeof image_path !== "string") {
+      throw new Error("image_path must be a non-empty string");
+    }
+    if (!fs.existsSync(image_path)) {
+      throw new Error(`File not found: ${image_path}`);
+    }
+
+    const dir = path.dirname(image_path);
+    const stem = path.basename(image_path, path.extname(image_path));
+    const pdfPath = path.join(dir, `${stem}.pdf`);
+
+    // Attempt remote ocrmypdf service first
+    try {
+      const fileBytes = fs.readFileSync(image_path);
+      const ext = path.extname(image_path).slice(1).toLowerCase() || "jpg";
+      const mimeMap = {
+        jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+        gif: "image/gif", webp: "image/webp", tiff: "image/tiff",
+        bmp: "image/bmp", pdf: "application/pdf",
+      };
+      const mime = mimeMap[ext] || "application/octet-stream";
+      const blob = new Blob([fileBytes], { type: mime });
+      const form = new FormData();
+      form.append("file", blob, path.basename(image_path));
+
+      const params = new URLSearchParams({
+        deskew: String(deskew),
+        optimize: String(optimize),
+      });
+
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 60000);
+
+      let resp;
+      try {
+        resp = await fetch(`${POLYCR_PDF_URL}/pdf?${params}`, {
+          method: "POST",
+          body: form,
+          signal: ac.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!resp.ok) {
+        const errBody = await resp.text().catch(() => "");
+        throw new Error(`ocrmypdf service HTTP ${resp.status}: ${errBody}`);
+      }
+
+      const pdfBuffer = Buffer.from(await resp.arrayBuffer());
+      fs.writeFileSync(pdfPath, pdfBuffer);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ pdf_path: pdfPath, size_bytes: pdfBuffer.length }),
+          },
+        ],
+      };
+    } catch (remoteErr) {
+      // Fallback: run tesseract locally to produce a PDF
+      const fallbackReason = remoteErr.name === "AbortError"
+        ? "ocrmypdf service timeout (60s)"
+        : `ocrmypdf service unreachable: ${remoteErr.message}`;
+
+      try {
+        const outStem = path.join(dir, stem);
+        await execFileAsync("tesseract", [image_path, outStem, "pdf"]);
+        const size = fs.statSync(pdfPath).size;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ pdf_path: pdfPath, size_bytes: size, fallback_reason: fallbackReason }),
+            },
+          ],
+        };
+      } catch (localErr) {
+        throw new Error(
+          `ocrmypdf service failed (${fallbackReason}) and local tesseract fallback also failed: ${localErr.message}`
+        );
+      }
+    }
   }
 
   throw new Error(`Unknown tool: ${name}`);

@@ -1,11 +1,29 @@
 # ocr-mcp
 
-An MCP (Model Context Protocol) server for OCR. Exposes 8 tools via the `@modelcontextprotocol/sdk` for image text extraction, preprocessing, and document classification. Used with OpenClaw (an AI assistant gateway) via Telegram.
+An MCP (Model Context Protocol) server for OCR and document scanning. Exposes 10 tools via the `@modelcontextprotocol/sdk` for image text extraction, preprocessing, document scanning, and searchable PDF generation. Used with OpenClaw (an AI assistant gateway) via Telegram.
+
+## Architecture
+
+Three services form the document scanning stack:
+
+```
+scan_document (this server) → JPEG temp file
+    ↓
+polycr :8000  — multi-engine OCR for text extraction and classification
+    ↓
+ocrmypdf :8001 — searchable PDF generation for archival
+    ↓
+Nextcloud (WebDAV)
+```
+
+Both polycr and ocrmypdf run as Docker Compose services on the OCR host (default: `192.168.1.11`).
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
+| `ocr__scan_document` | Scan from the HP OfficeJet 5740 (flatbed or ADF) at 300 DPI. |
+| `ocr__create_searchable_pdf` | Convert a scanned image to a searchable PDF via the ocrmypdf service (port 8001). Falls back to local Tesseract if the service is unreachable. |
 | `ocr__ocr_image_polycr` | Multi-engine OCR via the polycr stack (tesseract/easyocr/doctr) running on a remote host (default: `http://192.168.1.11:8000`). Falls back to local Tesseract if the polycr endpoint is unreachable. |
 | `ocr__ocr_image_local` | OCR using local Tesseract only — no network dependency. |
 | `ocr__ocr_image_from_base64` | Accept a base64-encoded image and run OCR on it. |
@@ -52,7 +70,7 @@ scanimage --device-name="escl:http://192.168.1.183:8080" \
    npm install
    ```
 
-2. Configure the polycr endpoint (if different from the default `http://192.168.1.11:8000`) by editing the constant at the top of `index.mjs`.
+2. Set `POLYCR_HOST` (default `192.168.1.11`) if your OCR host is at a different address. Both the polycr (port 8000) and ocrmypdf (port 8001) service URLs are derived from this value.
 
 3. Register the server in your OpenClaw MCP config (typically `~/.config/openclaw/mcp.json` or equivalent):
    ```json
