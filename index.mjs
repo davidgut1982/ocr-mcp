@@ -396,6 +396,52 @@ function extractTitleSlug(text) {
   return tokens.slice(0, 5).join(' ') || '';
 }
 
+// Why: Sends a JPEG to the ocrmypdf service and writes the resulting PDF to outPath.
+//      Extracted so both the Flatbed path and the ADF single-page merge path share
+//      identical PDF creation logic without duplication.
+// What: POSTs the JPEG to POLYCR_PDF_URL/pdf; on success writes the PDF buffer to
+//       outPath and returns outPath. Falls back to local tesseract PDF mode on failure;
+//       if that also fails, returns the original JPEG path so upload can continue.
+// Test: Mock fetch to return a PDF buffer; assert return value === outPath and file exists.
+//       Mock fetch to throw; assert fallback tesseract was attempted.
+async function createSearchablePdfFromJpeg(jpegPath, outPath) {
+  try {
+    const fileBytes = fs.readFileSync(jpegPath);
+    const blob = new Blob([fileBytes], { type: 'image/jpeg' });
+    const form = new FormData();
+    form.append('file', blob, 'scan.jpg');
+    const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1' });
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 60000);
+    let pdfResp;
+    try {
+      pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${pdfParams}`, {
+        method: 'POST',
+        body: form,
+        signal: ac.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (pdfResp.ok) {
+      const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
+      fs.writeFileSync(outPath, pdfBuf);
+      return outPath;
+    }
+    throw new Error(`ocrmypdf service HTTP ${pdfResp.status}`);
+  } catch (_) {
+    // Fallback: local tesseract PDF mode
+    try {
+      const outStem = outPath.replace('.pdf', '');
+      await execFileAsync('tesseract', [jpegPath, outStem, 'pdf']);
+      return outPath;
+    } catch (_localErr) {
+      // If PDF creation entirely fails, return JPEG so upload can still proceed
+      return jpegPath;
+    }
+  }
+}
+
 // Why: Encapsulates the WebDAV PUT flow so the atomic pipeline handler stays readable.
 // What: Ensures the target directory exists via MKCOL (ignores 405 = already exists),
 //       then uploads localPath as filename into nextcloudPath. Returns the final URL.
@@ -656,6 +702,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           filename: {
             type: "string",
             description: "Override auto-generated filename (e.g. 2026-04-13_verizon-bill.pdf)",
+          },
+          separate_pages: {
+            type: "boolean",
+            description: "ADF only: file each page as a separate document instead of merging into one PDF (default false)",
           },
         },
         required: ["profile"],
@@ -1161,7 +1211,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Test: Mock execSync for scanimage success; mock fetch for polycr and ocrmypdf;
     //       assert result.success is true, result.filed_at is non-null, and temp
     //       files are deleted by the end of the call.
-    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride } = args;
+    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride, separate_pages = false } = args;
     const params = PROFILE_PARAMS[profile];
     if (!params) throw new Error(`Unknown profile: ${profile}`);
 
@@ -1237,42 +1287,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Step 4: Create searchable PDF (skip for photo and event)
       let fileToUpload = tmpJpeg;
       if (profile !== 'photo' && profile !== 'event') {
-        try {
-          const fileBytes = fs.readFileSync(tmpJpeg);
-          const blob = new Blob([fileBytes], { type: 'image/jpeg' });
-          const form = new FormData();
-          form.append('file', blob, 'scan.jpg');
-          const params2 = new URLSearchParams({ deskew: 'true', optimize: '1' });
-          const ac = new AbortController();
-          const timer = setTimeout(() => ac.abort(), 60000);
-          let pdfResp;
-          try {
-            pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${params2}`, {
-              method: 'POST',
-              body: form,
-              signal: ac.signal,
-            });
-          } finally {
-            clearTimeout(timer);
-          }
-          if (pdfResp.ok) {
-            const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
-            fs.writeFileSync(tmpPdf, pdfBuf);
-            fileToUpload = tmpPdf;
-          } else {
-            throw new Error(`ocrmypdf service HTTP ${pdfResp.status}`);
-          }
-        } catch (_) {
-          // Fallback: local tesseract PDF mode
-          try {
-            const outStem = tmpPdf.replace('.pdf', '');
-            await execFileAsync('tesseract', [tmpJpeg, outStem, 'pdf']);
-            fileToUpload = tmpPdf;
-          } catch (localErr) {
-            // If PDF creation entirely fails, upload the JPEG instead
-            fileToUpload = tmpJpeg;
-          }
-        }
+        fileToUpload = await createSearchablePdfFromJpeg(tmpJpeg, tmpPdf);
       }
 
       // Step 5: Upload to Nextcloud (skip for event profile)
@@ -1305,20 +1320,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (isADF) {
         // Why: ADF feeder may contain multiple pages; scan one page at a time in a
         //      loop until SANE signals the feeder is empty (exit code 7 / "No documents").
-        // What: Accumulates per-page results into an array; returns multi-page envelope
-        //       when >1 page was scanned, flat result when only 1 page was filed.
-        // Test: Mock execSync to succeed twice then throw with "No documents"; assert
-        //       the returned object has pages===2 and results.length===2.
-        const pageResults = [];
+        // What: By default (separate_pages=false) collects all page JPEGs, merges them
+        //       into a single multi-page PDF via ImageMagick, OCRs the merged PDF once,
+        //       and files as one document. When separate_pages=true, falls back to the
+        //       original per-page pipeline for backward compatibility.
+        // Test: Mock execSync to succeed twice then throw with "No documents"; with
+        //       separate_pages=false assert result.pages===2 and result.success===true;
+        //       with separate_pages=true assert results.length===2.
+
+        // Step 1: Collect all page JPEGs from ADF
+        const pageJpegs = [];
         let pageNum = 0;
 
         while (true) {
           pageNum += 1;
           const tmpJpeg = `/tmp/scan_${timestamp}_p${pageNum}.jpg`;
-          const tmpPdf  = `/tmp/scan_${timestamp}_p${pageNum}.pdf`;
-          allTempFiles.push(tmpJpeg, tmpPdf);
+          allTempFiles.push(tmpJpeg);
 
-          // Step 1: Scan one page from ADF
           try {
             execSync(
               `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
@@ -1338,23 +1356,154 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             throw scanErr; // unexpected scan error — propagate
           }
 
-          const pageResult = await processSinglePage(tmpJpeg, tmpPdf, `p${pageNum}`);
-          pageResults.push(pageResult);
+          pageJpegs.push(tmpJpeg);
         }
 
-        if (pageResults.length === 0) {
+        if (pageJpegs.length === 0) {
           return {
             content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'ADF feeder was empty — no pages scanned.' }) }],
             isError: true,
           };
         }
 
-        // Return flat format for single page (backward compat), multi-page envelope otherwise
-        const response = pageResults.length === 1
-          ? pageResults[0]
-          : { success: true, pages: pageResults.length, results: pageResults };
+        if (separate_pages) {
+          // Opt-in: original per-page pipeline — process each JPEG independently
+          const pageResults = [];
+          for (let i = 0; i < pageJpegs.length; i++) {
+            const tmpJpeg = pageJpegs[i];
+            const tmpPdf  = `/tmp/scan_${timestamp}_p${i + 1}.pdf`;
+            allTempFiles.push(tmpPdf);
+            const pageResult = await processSinglePage(tmpJpeg, tmpPdf, `p${i + 1}`);
+            pageResults.push(pageResult);
+          }
 
-        return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+          // Return flat format for single page (backward compat), multi-page envelope otherwise
+          const response = pageResults.length === 1
+            ? pageResults[0]
+            : { success: true, pages: pageResults.length, results: pageResults };
+
+          return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+        }
+
+        // Default: merge all pages into one PDF and file as a single document
+        // Why: Multi-page ADF scans are one logical document; merging avoids N separate
+        //      Nextcloud files and preserves page order for searchable PDF output.
+
+        // Step 2: OCR page 1 only for filename/classification (title is on page 1)
+        let ocrText = '';
+        let wordCount = 0;
+        let confidence = 0;
+
+        if (profile !== 'photo') {
+          const ocrResult = await ocrWithFallback(pageJpegs[0]);
+          ocrText = ocrResult.text || '';
+          wordCount = ocrResult.word_count || 0;
+          confidence = ocrResult.confidence || 0;
+
+          // Low-confidence retry with image enhancement on page 1
+          if (wordCount < 10) {
+            const enhanced = pageJpegs[0].replace('.jpg', '_enhanced.jpg');
+            allTempFiles.push(enhanced);
+            try {
+              execSync(`convert ${JSON.stringify(pageJpegs[0])} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
+              const enhancedResult = await ocrWithFallback(enhanced);
+              if ((enhancedResult.word_count || 0) > wordCount) {
+                ocrText = enhancedResult.text || '';
+                wordCount = enhancedResult.word_count || 0;
+                confidence = enhancedResult.confidence || 0;
+              }
+            } catch (_) {
+              // enhancement failed — keep original OCR result
+            }
+          }
+        }
+
+        // Step 3: Classify + generate filename from page 1 OCR
+        const classification = classifyDocumentForFiling(ocrText, profile, description);
+        const ext = profile === 'photo' ? 'jpg' : 'pdf';
+        const filename = filenameOverride || generateFilename(ocrText, classification, description || '', ext);
+        const ncPath = ncPathOverride || classification.path;
+
+        // Step 4: Merge all page JPEGs into one PDF via ImageMagick, then run ocrmypdf
+        let fileToUpload;
+
+        if (profile === 'photo' || profile === 'event') {
+          // For photo/event profiles skip PDF creation; use page 1 JPEG only
+          fileToUpload = pageJpegs[0];
+        } else {
+          const mergedPdf = `/tmp/scan_${timestamp}_merged.pdf`;
+          allTempFiles.push(mergedPdf);
+
+          if (pageJpegs.length === 1) {
+            // Single page — no ImageMagick merge needed, process JPEG directly
+            fileToUpload = await createSearchablePdfFromJpeg(pageJpegs[0], mergedPdf);
+          } else {
+            // Multiple pages — merge JPEGs into a single PDF first
+            execSync(
+              `convert ${pageJpegs.map(p => JSON.stringify(p)).join(' ')} ${JSON.stringify(mergedPdf)}`,
+              { timeout: 60000 }
+            );
+
+            // Step 5: Run ocrmypdf on the merged PDF
+            const ocrPdf = `/tmp/scan_${timestamp}_ocr.pdf`;
+            allTempFiles.push(ocrPdf);
+            try {
+              const fileBytes = fs.readFileSync(mergedPdf);
+              const blob = new Blob([fileBytes], { type: 'application/pdf' });
+              const form = new FormData();
+              form.append('file', blob, 'merged.pdf');
+              const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1' });
+              const ac = new AbortController();
+              const timer = setTimeout(() => ac.abort(), 120000);
+              let pdfResp;
+              try {
+                pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${pdfParams}`, {
+                  method: 'POST',
+                  body: form,
+                  signal: ac.signal,
+                });
+              } finally {
+                clearTimeout(timer);
+              }
+              if (pdfResp.ok) {
+                const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
+                fs.writeFileSync(ocrPdf, pdfBuf);
+                fileToUpload = ocrPdf;
+              } else {
+                throw new Error(`ocrmypdf service HTTP ${pdfResp.status}`);
+              }
+            } catch (_) {
+              // Fallback: use the raw merged PDF without OCR layer
+              fileToUpload = mergedPdf;
+            }
+          }
+        }
+
+        // Step 6: Upload single PDF to Nextcloud
+        if (profile !== 'event' && ncPath) {
+          await nextcloudUpload(fileToUpload, ncPath, filename);
+        }
+
+        // Build flat single-result response
+        const mergedResult = {
+          success: true,
+          profile,
+          filename,
+          nextcloud_path: ncPath,
+          filed_at: ncPath ? `${ncPath}${filename}` : null,
+          document_type: classification.type,
+          pages: pageJpegs.length,
+          word_count: wordCount,
+          confidence: Math.round(confidence * 100) / 100,
+          ocr_preview: ocrText.slice(0, 300).trim() || null,
+        };
+
+        if (profile === 'event') {
+          mergedResult.note = 'Event profile — use ocr__extract_event_details for calendar creation instead.';
+          mergedResult.raw_text = ocrText;
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(mergedResult, null, 2) }] };
 
       } else {
         // Non-ADF (Flatbed): original single-scan path
