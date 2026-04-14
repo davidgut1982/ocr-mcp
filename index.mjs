@@ -1166,16 +1166,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!params) throw new Error(`Unknown profile: ${profile}`);
 
     const timestamp = Date.now();
-    const tmpJpeg = `/tmp/scan_${timestamp}.jpg`;
-    const tmpPdf  = `/tmp/scan_${timestamp}.pdf`;
+    const isADF = params.source === 'ADF';
 
-    try {
-      // Step 1: Scan
-      execSync(
-        `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
-        { timeout: 60000 }
-      );
+    // Why: Track all temp files across all pages so the finally block can clean
+    //      them up regardless of success or failure on any individual page.
+    const allTempFiles = [];
 
+    // Why: Track generated base filenames to detect same-second collisions and
+    //      append _p2, _p3 suffixes before the extension.
+    const usedFilenames = new Set();
+
+    /**
+     * Why: Encapsulates the OCR→classify→PDF→upload pipeline for a single page
+     *      so it can be called in a loop for ADF or once for Flatbed.
+     * What: Given a JPEG temp path and per-page PDF temp path, runs Steps 2-5
+     *       and returns the flat result object.
+     * Test: Pass a known JPEG path with mocked ocrWithFallback; assert result.success.
+     */
+    async function processSinglePage(tmpJpeg, tmpPdf, pageLabel) {
       // Step 2: OCR (skip for photo profile)
       let ocrText = '';
       let wordCount = 0;
@@ -1189,7 +1197,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Low-confidence retry with image enhancement
         if (wordCount < 10) {
-          const enhanced = `/tmp/scan_${timestamp}_enhanced.jpg`;
+          const enhanced = tmpJpeg.replace('.jpg', '_enhanced.jpg');
+          allTempFiles.push(enhanced);
           try {
             execSync(`convert ${JSON.stringify(tmpJpeg)} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
             const enhancedResult = await ocrWithFallback(enhanced);
@@ -1200,16 +1209,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
           } catch (_) {
             // enhancement failed — keep original OCR result
-          } finally {
-            try { execSync(`rm -f ${JSON.stringify(enhanced)}`); } catch (_) {}
           }
         }
       }
 
-      // Step 3: Classify + generate filename
+      // Step 3: Classify + generate filename (deduplicate same-second collisions)
       const classification = classifyDocumentForFiling(ocrText, profile, description);
       const ext = profile === 'photo' ? 'jpg' : 'pdf';
-      const filename = filenameOverride || generateFilename(ocrText, classification, description || '', ext);
+      let baseFilename = filenameOverride || generateFilename(ocrText, classification, description || '', ext);
+      if (usedFilenames.has(baseFilename)) {
+        // Append _p2, _p3 … before the extension to avoid collisions
+        const dotIdx = baseFilename.lastIndexOf('.');
+        const stem = dotIdx >= 0 ? baseFilename.slice(0, dotIdx) : baseFilename;
+        const extPart = dotIdx >= 0 ? baseFilename.slice(dotIdx) : '';
+        let suffix = 2;
+        let candidate = `${stem}_p${suffix}${extPart}`;
+        while (usedFilenames.has(candidate)) {
+          suffix += 1;
+          candidate = `${stem}_p${suffix}${extPart}`;
+        }
+        baseFilename = candidate;
+      }
+      usedFilenames.add(baseFilename);
+      const filename = baseFilename;
       const ncPath = ncPathOverride || classification.path;
 
       // Step 4: Create searchable PDF (skip for photo and event)
@@ -1254,15 +1276,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       // Step 5: Upload to Nextcloud (skip for event profile)
-      let uploadUrl = null;
       if (profile !== 'event' && ncPath) {
-        uploadUrl = await nextcloudUpload(fileToUpload, ncPath, filename);
+        await nextcloudUpload(fileToUpload, ncPath, filename);
       }
 
-      // Step 6: Cleanup temp files
-      try { execSync(`rm -f ${JSON.stringify(tmpJpeg)} ${JSON.stringify(tmpPdf)}`); } catch (_) {}
-
-      // Step 7: Return result
+      // Build per-page result object
       const result = {
         success: true,
         profile,
@@ -1280,14 +1298,90 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result.raw_text = ocrText;
       }
 
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      return result;
+    }
+
+    try {
+      if (isADF) {
+        // Why: ADF feeder may contain multiple pages; scan one page at a time in a
+        //      loop until SANE signals the feeder is empty (exit code 7 / "No documents").
+        // What: Accumulates per-page results into an array; returns multi-page envelope
+        //       when >1 page was scanned, flat result when only 1 page was filed.
+        // Test: Mock execSync to succeed twice then throw with "No documents"; assert
+        //       the returned object has pages===2 and results.length===2.
+        const pageResults = [];
+        let pageNum = 0;
+
+        while (true) {
+          pageNum += 1;
+          const tmpJpeg = `/tmp/scan_${timestamp}_p${pageNum}.jpg`;
+          const tmpPdf  = `/tmp/scan_${timestamp}_p${pageNum}.pdf`;
+          allTempFiles.push(tmpJpeg, tmpPdf);
+
+          // Step 1: Scan one page from ADF
+          try {
+            execSync(
+              `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
+              { timeout: 60000 }
+            );
+          } catch (scanErr) {
+            // SANE exit code 7 / "No documents in feeder" / "Document feeder empty"
+            // means normal end-of-feeder — not an error worth reporting.
+            const msg = (scanErr.stderr || scanErr.message || '').toString();
+            if (
+              msg.includes('No documents') ||
+              msg.includes('Document feeder empty') ||
+              (scanErr.status === 7)
+            ) {
+              break; // feeder exhausted — stop the loop
+            }
+            throw scanErr; // unexpected scan error — propagate
+          }
+
+          const pageResult = await processSinglePage(tmpJpeg, tmpPdf, `p${pageNum}`);
+          pageResults.push(pageResult);
+        }
+
+        if (pageResults.length === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'ADF feeder was empty — no pages scanned.' }) }],
+            isError: true,
+          };
+        }
+
+        // Return flat format for single page (backward compat), multi-page envelope otherwise
+        const response = pageResults.length === 1
+          ? pageResults[0]
+          : { success: true, pages: pageResults.length, results: pageResults };
+
+        return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+
+      } else {
+        // Non-ADF (Flatbed): original single-scan path
+        const tmpJpeg = `/tmp/scan_${timestamp}.jpg`;
+        const tmpPdf  = `/tmp/scan_${timestamp}.pdf`;
+        allTempFiles.push(tmpJpeg, tmpPdf);
+
+        // Step 1: Scan
+        execSync(
+          `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
+          { timeout: 60000 }
+        );
+
+        const result = await processSinglePage(tmpJpeg, tmpPdf, 'p1');
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
 
     } catch (err) {
-      try { execSync(`rm -f ${JSON.stringify(tmpJpeg)} ${JSON.stringify(tmpPdf)}`); } catch (_) {}
       return {
         content: [{ type: 'text', text: JSON.stringify({ success: false, error: err.message }) }],
         isError: true,
       };
+    } finally {
+      // Clean up all temp files regardless of success or failure
+      for (const f of allTempFiles) {
+        try { execSync(`rm -f ${JSON.stringify(f)}`); } catch (_) {}
+      }
     }
   }
 
