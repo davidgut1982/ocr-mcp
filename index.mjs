@@ -307,7 +307,19 @@ function generateFilename(text, classification, description, ext) {
   else if (m3) dateStr = `${m3[3]}-${months[m3[1].toLowerCase()]}-${m3[2].padStart(2,'0')}`;
   else         dateStr = new Date().toISOString().split('T')[0];
 
-  let slug = description || classification.type;
+  let slug;
+  if (description) {
+    slug = description;
+  } else {
+    // Extract meaningful words from OCR text when no description is provided.
+    const stopWords = new Set(['the','a','an','of','and','or','in','to','for','is','are','was',
+      'were','with','from','by','at','on','this','that','these','those','it','its','be','been',
+      'has','have','had','not','but','as','if','so','do','did','will','would','could','should']);
+    const tokens = text.split(/\s+/)
+      .map(t => t.toLowerCase().replace(/[^a-z0-9]/g, ''))
+      .filter(t => t.length > 2 && !stopWords.has(t));
+    slug = tokens.slice(0, 5).join('-') || classification.type;
+  }
   slug = slug.toLowerCase().trim()
     .replace(/\s+/g, '-')
     .replace(/[^a-z0-9\-]/g, '')
