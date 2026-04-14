@@ -228,7 +228,7 @@ function classifyDocument(text) {
   return { likely_document_type: likely, document_signals: signals };
 }
 
-// --- ocr__scan_and_file helpers ---
+// --- scan_and_file helpers ---
 
 // Why: Maps profile names to scanimage parameters so the atomic pipeline tool
 //      doesn't need a large switch statement at call-site.
@@ -343,7 +343,7 @@ async function nextcloudUpload(localPath, nextcloudPath, filename) {
   return url;
 }
 
-// --- end ocr__scan_and_file helpers ---
+// --- end scan_and_file helpers ---
 
 const server = new Server(
   { name: "ocr-mcp", version: "1.2.0" },
@@ -555,7 +555,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
-      name: "ocr__scan_and_file",
+      name: "scan_and_file",
       description:
         "Atomic pipeline: scan document → OCR → create searchable PDF → upload to Nextcloud. Executes the full pipeline in one call. Returns what was scanned, filename used, and where it was filed.",
       inputSchema: {
@@ -1073,7 +1073,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
-  if (name === "ocr__scan_and_file") {
+  if (name === "scan_and_file") {
     // Why: Executes the full scan→OCR→PDF→upload pipeline atomically so a context
     //      bootstrap reset cannot interrupt it between steps.
     // What: Scans via scanimage, OCRs via polycr (Tesseract fallback), creates a
