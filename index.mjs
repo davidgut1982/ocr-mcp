@@ -287,9 +287,10 @@ function classifyDocumentForFiling(text, profile, description) {
 // Why: Produces consistent, date-prefixed filenames from OCR text so documents are
 //      sortable by date without manual renaming.
 // What: Extracts first recognizable date from text (ISO, US, or long-form month);
-//       falls back to today. Appends a sanitized slug from description or type.
-// Test: Call with text="January 5, 2026" description="verizon bill" ext="pdf";
-//       assert result === "2026-01-05_verizon-bill.pdf".
+//       falls back to today. Appends a sanitized slug derived from a title-like line
+//       near the top of the document, or from description/classification as fallback.
+// Test: Call with text="SUMMER ENRICHMENT PROGRAM\nJune 1, 2026" ext="pdf";
+//       assert result starts with "2026-06-01_summer-enrichment-program".
 function generateFilename(text, classification, description, ext) {
   const months = {
     january:'01', february:'02', march:'03',    april:'04',
@@ -311,14 +312,7 @@ function generateFilename(text, classification, description, ext) {
   if (description) {
     slug = description;
   } else {
-    // Extract meaningful words from OCR text when no description is provided.
-    const stopWords = new Set(['the','a','an','of','and','or','in','to','for','is','are','was',
-      'were','with','from','by','at','on','this','that','these','those','it','its','be','been',
-      'has','have','had','not','but','as','if','so','do','did','will','would','could','should']);
-    const tokens = text.split(/\s+/)
-      .map(t => t.toLowerCase().replace(/[^a-z0-9]/g, ''))
-      .filter(t => t.length > 2 && !stopWords.has(t));
-    slug = tokens.slice(0, 5).join('-') || classification.type;
+    slug = extractTitleSlug(text) || classification.type;
   }
   slug = slug.toLowerCase().trim()
     .replace(/\s+/g, '-')
@@ -327,6 +321,79 @@ function generateFilename(text, classification, description, ext) {
     .slice(0, 40);
 
   return `${dateStr}_${slug}.${ext}`;
+}
+
+// Why: Centralises title-extraction heuristics so generateFilename stays readable.
+// What: Scans the first 15 lines of OCR text for a title-like line using three
+//       ranked heuristics: (1) all-caps 2-6 word line in first 15 lines,
+//       (2) title-case or mostly-alpha line with 2-8 words in first 10 lines,
+//       (3) fallback to first 5 non-stop-word tokens from the full text.
+// Test: Pass "INVOICE\nDate: 2026-01-01" → expect "INVOICE".
+//       Pass "My Great Report\npage 1" → expect "My Great Report".
+//       Pass "99-AB-4422\nJohn Smith\n123 Main St" → expect "john-smith" (token fallback).
+function extractTitleSlug(text) {
+  const stopWords = new Set(['the','a','an','of','and','or','in','to','for','is','are','was',
+    'were','with','from','by','at','on','this','that','these','those','it','its','be','been',
+    'has','have','had','not','but','as','if','so','do','did','will','would','could','should']);
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+
+  // Returns true when a line looks like noise rather than a document title.
+  // Rejects lines that start with digits, contain @ or http, look like phone
+  // numbers / form codes, are predominantly non-alpha characters, follow a
+  // "Label: value" pattern, or consist mostly of digit-bearing tokens.
+  function isNoiseLine(line) {
+    if (/^[\d]/.test(line))          return true; // starts with digit
+    if (/@|https?:\/\//i.test(line)) return true; // email / URL
+    if (/^\d[\d\s\-().]{6,}$/.test(line)) return true; // phone-like
+    // "Key: value" label lines (colon after 1-3 words) — not a document title.
+    if (/^[A-Za-z][A-Za-z\s]{0,20}:/.test(line)) return true;
+    // Require at least 60 % of word characters to be alphabetic.
+    const wordChars = line.replace(/[^a-zA-Z0-9]/g, '');
+    if (wordChars.length === 0) return true;
+    const alphaRatio = (line.replace(/[^a-zA-Z]/g, '').length) / wordChars.length;
+    if (alphaRatio < 0.6) return true;
+    // Reject lines where the majority of tokens contain a digit (e.g. "page 1 of 3").
+    const tokens = line.split(/\s+/).filter(t => t.length > 0);
+    const digitTokens = tokens.filter(t => /\d/.test(t)).length;
+    if (tokens.length > 0 && digitTokens / tokens.length > 0.4) return true;
+    return false;
+  }
+
+  function wordCount(line) {
+    return line.split(/\s+/).filter(w => w.length > 0).length;
+  }
+
+  // Returns true when the majority of alphabetic words in a line are stop words,
+  // indicating navigational/boilerplate text rather than a document title.
+  function isStopWordHeavy(line) {
+    const words = line.split(/\s+/).map(w => w.toLowerCase().replace(/[^a-z]/g, '')).filter(w => w.length > 0);
+    if (words.length === 0) return true;
+    const stopCount = words.filter(w => stopWords.has(w)).length;
+    return stopCount / words.length > 0.5;
+  }
+
+  // Heuristic 1: ALL-CAPS line (1-6 words) in first 15 lines.
+  for (const line of lines.slice(0, 15)) {
+    const wc = wordCount(line);
+    if (wc >= 1 && wc <= 6 && line === line.toUpperCase() && /[A-Z]/.test(line) && !isNoiseLine(line) && !isStopWordHeavy(line)) {
+      return line;
+    }
+  }
+
+  // Heuristic 2: Title-case or mostly-alpha line (2-8 words) in first 10 lines.
+  for (const line of lines.slice(0, 10)) {
+    const wc = wordCount(line);
+    if (wc >= 2 && wc <= 8 && line.length > 3 && !isNoiseLine(line) && !isStopWordHeavy(line)) {
+      return line;
+    }
+  }
+
+  // Heuristic 3: Fallback — first 5 non-stop-word tokens from the full text.
+  const tokens = text.split(/\s+/)
+    .map(t => t.toLowerCase().replace(/[^a-z0-9]/g, ''))
+    .filter(t => t.length > 2 && !stopWords.has(t));
+  return tokens.slice(0, 5).join(' ') || '';
 }
 
 // Why: Encapsulates the WebDAV PUT flow so the atomic pipeline handler stays readable.
