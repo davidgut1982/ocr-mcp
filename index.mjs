@@ -1248,6 +1248,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const params = PROFILE_PARAMS[profile];
     if (!params) throw new Error(`Unknown profile: ${profile}`);
 
+    // Canon MF741C ADF only accepts Color mode (Gray returns "Invalid argument")
+    let scanMode = params.mode;
+    if (scanner === 'canon-mf741c' && params.source === 'ADF') {
+      scanMode = 'Color';
+    }
+
     const timestamp = Date.now();
     const isADF = params.source === 'ADF';
 
@@ -1377,7 +1383,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
           try {
             execSync(
-              `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
+              `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(scanMode)} --source=${JSON.stringify(params.source)}`,
               { timeout: 60000 }
             );
           } catch (scanErr) {
@@ -1565,7 +1571,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Step 1: Scan
         execSync(
-          `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
+          `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(scanMode)} --source=${JSON.stringify(params.source)}`,
           { timeout: 60000 }
         );
 
