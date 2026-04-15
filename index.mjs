@@ -20,7 +20,7 @@ const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:
 
 const SCANNERS = {
   'hp-officejet-5740': process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080',
-  'canon-mf741c':      'escl:http://192.168.1.140:80',
+  'canon-mf741c':      'airscan:e0:Canon MF741C',
 };
 // Default scanner (backward compat)
 const DEFAULT_SCANNER = SCANNERS['hp-officejet-5740'];
