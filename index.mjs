@@ -406,45 +406,51 @@ function extractTitleSlug(text) {
 // Why: Sends a JPEG to the ocrmypdf service and writes the resulting PDF to outPath.
 //      Extracted so both the Flatbed path and the ADF single-page merge path share
 //      identical PDF creation logic without duplication.
-// What: POSTs the JPEG to POLYCR_PDF_URL/pdf; on success writes the PDF buffer to
-//       outPath and returns { path: outPath, method: "polycr" }. Falls back to the
-//       ocrmypdf CLI, then tesseract. Throws if all three attempts fail — callers
-//       must not upload a JPEG renamed to .pdf.
-// Test: Mock fetch to return a PDF buffer; assert result.method === "polycr".
-//       Mock fetch to throw and ocrmypdf CLI absent; assert result.method === "tesseract-local".
+// What: Runs local ocrmypdf CLI first (most reliable — polycr rejects low-DPI images
+//       with HTTP 200 + JSON error instead of a real PDF). Falls back to the polycr
+//       remote service, then bare tesseract. Throws if all three attempts fail.
+//       Scanned JPEGs always originate at 300 DPI so --image-dpi 300 is hardcoded.
+// Test: Verify ocrmypdf CLI produces a PDF with %PDF magic bytes and OCR text layer.
+//       Mock CLI to throw; mock fetch to return a valid PDF buffer; assert method === "polycr".
 //       Mock all three to fail; assert the function throws.
 async function createSearchablePdfFromJpeg(jpegPath, outPath) {
-  // Attempt 1: remote ocrmypdf service at port 8001
+  // Attempt 1: local ocrmypdf CLI — reliable, handles images without credible DPI metadata
   try {
-    const fileBytes = fs.readFileSync(jpegPath);
-    const blob = new Blob([fileBytes], { type: 'image/jpeg' });
-    const form = new FormData();
-    form.append('file', blob, 'scan.jpg');
-    const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1' });
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 60000);
-    let pdfResp;
+    await execFileAsync('ocrmypdf', ['--deskew', '--optimize', '1', '--image-dpi', '300', jpegPath, outPath]);
+    return { path: outPath, method: 'ocrmypdf-local' };
+  } catch (cliErr) {
+    // Attempt 2: remote polycr service at port 8001
     try {
-      pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${pdfParams}`, {
-        method: 'POST',
-        body: form,
-        signal: ac.signal,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-    if (pdfResp.ok) {
+      const fileBytes = fs.readFileSync(jpegPath);
+      const blob = new Blob([fileBytes], { type: 'image/jpeg' });
+      const form = new FormData();
+      form.append('file', blob, 'scan.jpg');
+      const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1' });
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 60000);
+      let pdfResp;
+      try {
+        pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${pdfParams}`, {
+          method: 'POST',
+          body: form,
+          signal: ac.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!pdfResp.ok) {
+        throw new Error(`polycr service HTTP ${pdfResp.status}`);
+      }
       const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
+      // Validate the response is actually a PDF — polycr returns HTTP 200 with a JSON
+      // error body when it rejects the image (e.g. unrecognised DPI), which would produce
+      // a file with no text layer.
+      if (pdfBuf.length < 5 || pdfBuf.slice(0, 5).toString('ascii') !== '%PDF-') {
+        throw new Error(`polycr service returned non-PDF response (${pdfBuf.length} bytes)`);
+      }
       fs.writeFileSync(outPath, pdfBuf);
       return { path: outPath, method: 'polycr' };
-    }
-    throw new Error(`ocrmypdf service HTTP ${pdfResp.status}`);
-  } catch (remoteErr) {
-    // Attempt 2: ocrmypdf CLI installed locally (more reliable than bare tesseract)
-    try {
-      await execFileAsync('ocrmypdf', ['--deskew', '--optimize', '1', jpegPath, outPath]);
-      return { path: outPath, method: 'ocrmypdf-local' };
-    } catch (_cliErr) {
+    } catch (remoteErr) {
       // Attempt 3: bare tesseract pdf mode as last resort
       try {
         const outStem = outPath.replace(/\.pdf$/, '');
@@ -452,8 +458,8 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath) {
         return { path: outPath, method: 'tesseract-local' };
       } catch (tesseractErr) {
         throw new Error(
-          `PDF creation failed — polycr service: ${remoteErr.message}; ` +
-          `ocrmypdf CLI: ${_cliErr.message}; ` +
+          `PDF creation failed — ocrmypdf CLI: ${cliErr.message}; ` +
+          `polycr service: ${remoteErr.message}; ` +
           `tesseract: ${tesseractErr.message}`
         );
       }
