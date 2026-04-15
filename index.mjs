@@ -18,6 +18,13 @@ const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
 const POLYCR_PDF_URL = `http://${POLYCR_HOST}:8001`;
 const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
 
+const SCANNERS = {
+  'hp-officejet-5740': process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080',
+  'canon-mf741c':      'escl:http://192.168.1.140:80',
+};
+// Default scanner (backward compat)
+const DEFAULT_SCANNER = SCANNERS['hp-officejet-5740'];
+
 const NEXTCLOUD_URL = process.env.NEXTCLOUD_URL || 'https://nextcloud.shifting-ground.link';
 const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER || 'david.gutowsky';
 const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD || '';
@@ -642,7 +649,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "scan_document",
       description:
-        "Scan a document from the HP OfficeJet 5740 using scanimage. Uses SCANNER_DEVICE env var (default escl:http://192.168.1.183:8080). Returns success, path, resolution, mode, and source on success.",
+        "Scan a document using scanimage. Defaults to hp-officejet-5740 (escl:http://192.168.1.183:8080). Returns success, path, resolution, mode, source, and scanner on success.",
       inputSchema: {
         type: "object",
         properties: {
@@ -663,6 +670,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             enum: ["Flatbed", "ADF"],
             description: "Flatbed platen or ADF feeder (default Flatbed)",
+          },
+          scanner: {
+            type: "string",
+            enum: ["hp-officejet-5740", "canon-mf741c"],
+            description: "Which scanner to use (default: hp-officejet-5740)",
           },
         },
         required: ["output_path"],
@@ -718,6 +730,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           separate_pages: {
             type: "boolean",
             description: "ADF only: file each page as a separate document instead of merging into one PDF (default false)",
+          },
+          scanner: {
+            type: "string",
+            enum: ["hp-officejet-5740", "canon-mf741c"],
+            description: "Which scanner to use (default: hp-officejet-5740)",
           },
         },
         required: ["profile"],
@@ -1068,7 +1085,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       resolution = 300,
       mode = "Color",
       source = "Flatbed",
+      scanner = 'hp-officejet-5740',
     } = args;
+    const deviceName = SCANNERS[scanner] || DEFAULT_SCANNER;
 
     if (!output_path || typeof output_path !== "string") {
       throw new Error("output_path must be a non-empty string");
@@ -1089,7 +1108,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
       execSync(
-        `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=${format} --output-file=${JSON.stringify(output_path)} --resolution=${resolution} --mode=${JSON.stringify(mode)} --source=${JSON.stringify(source)}`
+        `scanimage --device-name=${JSON.stringify(deviceName)} --format=${format} --output-file=${JSON.stringify(output_path)} --resolution=${resolution} --mode=${JSON.stringify(mode)} --source=${JSON.stringify(source)}`
       );
     } catch (e) {
       return {
@@ -1112,6 +1131,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             resolution,
             mode,
             source,
+            scanner,
           }),
         },
       ],
@@ -1223,7 +1243,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Test: Mock execSync for scanimage success; mock fetch for polycr and ocrmypdf;
     //       assert result.success is true, result.filed_at is non-null, and temp
     //       files are deleted by the end of the call.
-    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride, separate_pages = false } = args;
+    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride, separate_pages = false, scanner = 'hp-officejet-5740' } = args;
+    const deviceName = SCANNERS[scanner] || DEFAULT_SCANNER;
     const params = PROFILE_PARAMS[profile];
     if (!params) throw new Error(`Unknown profile: ${profile}`);
 
@@ -1314,6 +1335,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = {
         success: true,
         profile,
+        scanner,
         filename,
         nextcloud_path: ncPath,
         filed_at: ncPath ? `${ncPath}${filename}` : null,
@@ -1355,7 +1377,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
           try {
             execSync(
-              `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
+              `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
               { timeout: 60000 }
             );
           } catch (scanErr) {
@@ -1516,6 +1538,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const mergedResult = {
           success: true,
           profile,
+          scanner,
           filename,
           nextcloud_path: ncPath,
           filed_at: ncPath ? `${ncPath}${filename}` : null,
@@ -1542,7 +1565,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Step 1: Scan
         execSync(
-          `scanimage --device-name=${JSON.stringify(SCANNER_DEVICE)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
+          `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(params.mode)} --source=${JSON.stringify(params.source)}`,
           { timeout: 60000 }
         );
 
