@@ -400,11 +400,14 @@ function extractTitleSlug(text) {
 //      Extracted so both the Flatbed path and the ADF single-page merge path share
 //      identical PDF creation logic without duplication.
 // What: POSTs the JPEG to POLYCR_PDF_URL/pdf; on success writes the PDF buffer to
-//       outPath and returns outPath. Falls back to local tesseract PDF mode on failure;
-//       if that also fails, returns the original JPEG path so upload can continue.
-// Test: Mock fetch to return a PDF buffer; assert return value === outPath and file exists.
-//       Mock fetch to throw; assert fallback tesseract was attempted.
+//       outPath and returns { path: outPath, method: "polycr" }. Falls back to the
+//       ocrmypdf CLI, then tesseract. Throws if all three attempts fail — callers
+//       must not upload a JPEG renamed to .pdf.
+// Test: Mock fetch to return a PDF buffer; assert result.method === "polycr".
+//       Mock fetch to throw and ocrmypdf CLI absent; assert result.method === "tesseract-local".
+//       Mock all three to fail; assert the function throws.
 async function createSearchablePdfFromJpeg(jpegPath, outPath) {
+  // Attempt 1: remote ocrmypdf service at port 8001
   try {
     const fileBytes = fs.readFileSync(jpegPath);
     const blob = new Blob([fileBytes], { type: 'image/jpeg' });
@@ -426,18 +429,27 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath) {
     if (pdfResp.ok) {
       const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
       fs.writeFileSync(outPath, pdfBuf);
-      return outPath;
+      return { path: outPath, method: 'polycr' };
     }
     throw new Error(`ocrmypdf service HTTP ${pdfResp.status}`);
-  } catch (_) {
-    // Fallback: local tesseract PDF mode
+  } catch (remoteErr) {
+    // Attempt 2: ocrmypdf CLI installed locally (more reliable than bare tesseract)
     try {
-      const outStem = outPath.replace('.pdf', '');
-      await execFileAsync('tesseract', [jpegPath, outStem, 'pdf']);
-      return outPath;
-    } catch (_localErr) {
-      // If PDF creation entirely fails, return JPEG so upload can still proceed
-      return jpegPath;
+      await execFileAsync('ocrmypdf', ['--deskew', '--optimize', '1', jpegPath, outPath]);
+      return { path: outPath, method: 'ocrmypdf-local' };
+    } catch (_cliErr) {
+      // Attempt 3: bare tesseract pdf mode as last resort
+      try {
+        const outStem = outPath.replace(/\.pdf$/, '');
+        await execFileAsync('tesseract', [jpegPath, outStem, 'pdf']);
+        return { path: outPath, method: 'tesseract-local' };
+      } catch (tesseractErr) {
+        throw new Error(
+          `PDF creation failed — polycr service: ${remoteErr.message}; ` +
+          `ocrmypdf CLI: ${_cliErr.message}; ` +
+          `tesseract: ${tesseractErr.message}`
+        );
+      }
     }
   }
 }
@@ -1286,8 +1298,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // Step 4: Create searchable PDF (skip for photo and event)
       let fileToUpload = tmpJpeg;
+      let pdfMethod = 'jpeg-only';
       if (profile !== 'photo' && profile !== 'event') {
-        fileToUpload = await createSearchablePdfFromJpeg(tmpJpeg, tmpPdf);
+        const pdfResult = await createSearchablePdfFromJpeg(tmpJpeg, tmpPdf);
+        fileToUpload = pdfResult.path;
+        pdfMethod = pdfResult.method;
       }
 
       // Step 5: Upload to Nextcloud (skip for event profile)
@@ -1303,6 +1318,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         nextcloud_path: ncPath,
         filed_at: ncPath ? `${ncPath}${filename}` : null,
         document_type: classification.type,
+        pdf_method: pdfMethod,
         word_count: wordCount,
         confidence: Math.round(confidence * 100) / 100,
         ocr_preview: ocrText.slice(0, 300).trim() || null,
@@ -1426,6 +1442,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Step 4: Merge all page JPEGs into one PDF via ImageMagick, then run ocrmypdf
         let fileToUpload;
+        let pdfMethod = 'jpeg-only';
 
         if (profile === 'photo' || profile === 'event') {
           // For photo/event profiles skip PDF creation; use page 1 JPEG only
@@ -1436,7 +1453,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
           if (pageJpegs.length === 1) {
             // Single page — no ImageMagick merge needed, process JPEG directly
-            fileToUpload = await createSearchablePdfFromJpeg(pageJpegs[0], mergedPdf);
+            const pdfResult = await createSearchablePdfFromJpeg(pageJpegs[0], mergedPdf);
+            fileToUpload = pdfResult.path;
+            pdfMethod = pdfResult.method;
           } else {
             // Multiple pages — merge JPEGs into a single PDF first
             execSync(
@@ -1444,7 +1463,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               { timeout: 60000 }
             );
 
-            // Step 5: Run ocrmypdf on the merged PDF
+            // Step 5: Run ocrmypdf on the merged PDF (remote service, then local CLI fallback)
             const ocrPdf = `/tmp/scan_${timestamp}_ocr.pdf`;
             allTempFiles.push(ocrPdf);
             try {
@@ -1469,12 +1488,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
                 fs.writeFileSync(ocrPdf, pdfBuf);
                 fileToUpload = ocrPdf;
+                pdfMethod = 'polycr';
               } else {
                 throw new Error(`ocrmypdf service HTTP ${pdfResp.status}`);
               }
-            } catch (_) {
-              // Fallback: use the raw merged PDF without OCR layer
-              fileToUpload = mergedPdf;
+            } catch (_remoteErr) {
+              // Fallback: ocrmypdf CLI on the already-merged PDF
+              try {
+                await execFileAsync('ocrmypdf', ['--deskew', '--optimize', '1', mergedPdf, ocrPdf]);
+                fileToUpload = ocrPdf;
+                pdfMethod = 'ocrmypdf-local';
+              } catch (_cliErr) {
+                // Last resort: upload the raw merged PDF without a text layer
+                fileToUpload = mergedPdf;
+                pdfMethod = 'merged-no-ocr';
+              }
             }
           }
         }
@@ -1492,6 +1520,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           nextcloud_path: ncPath,
           filed_at: ncPath ? `${ncPath}${filename}` : null,
           document_type: classification.type,
+          pdf_method: pdfMethod,
           pages: pageJpegs.length,
           word_count: wordCount,
           confidence: Math.round(confidence * 100) / 100,
