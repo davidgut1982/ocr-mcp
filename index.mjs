@@ -416,7 +416,7 @@ function extractTitleSlug(text) {
 async function createSearchablePdfFromJpeg(jpegPath, outPath) {
   // Attempt 1: local ocrmypdf CLI — reliable, handles images without credible DPI metadata
   try {
-    await execFileAsync('ocrmypdf', ['--deskew', '--optimize', '1', '--image-dpi', '300', jpegPath, outPath]);
+    await execFileAsync('ocrmypdf', ['--rotate-pages', '--deskew', '--optimize', '1', '--image-dpi', '300', jpegPath, outPath]);
     return { path: outPath, method: 'ocrmypdf-local' };
   } catch (cliErr) {
     // Attempt 2: remote polycr service at port 8001
@@ -1505,7 +1505,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               const blob = new Blob([fileBytes], { type: 'application/pdf' });
               const form = new FormData();
               form.append('file', blob, 'merged.pdf');
-              const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1' });
+              const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1', rotate_pages: 'true' });
               const ac = new AbortController();
               const timer = setTimeout(() => ac.abort(), 120000);
               let pdfResp;
