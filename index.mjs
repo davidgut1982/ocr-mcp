@@ -269,6 +269,23 @@ function classifyDocumentForFiling(text, profile, description) {
     return { type: 'id', path: '/Personal/Identity/' };
   }
 
+  // Load routing rules config — allows address/property-based routing without code changes
+  let routingRules = { properties: [], custom_rules: [] };
+  try {
+    const rulesPath = path.join(os.homedir(), '.ocr-mcp', 'routing-rules.json');
+    if (fs.existsSync(rulesPath)) {
+      routingRules = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
+    }
+  } catch (_) {}
+
+  // Check property-based routing first (most specific — beats all generic keyword checks)
+  for (const prop of (routingRules.properties || [])) {
+    const keywords = prop.keywords || [prop.address];
+    if (keywords.some(kw => lower.includes(kw.toLowerCase()))) {
+      return { type: 'housing', path: prop.path };
+    }
+  }
+
   if (lower.match(/invoice|receipt|total\s*\$|subtotal|thank you for your (purchase|order)/))
     return { type: 'receipt',   path: '/Personal/Financial/Receipts/' };
   if (lower.match(/prescription|diagnosis|patient|physician|hospital|lab result|immunization/))
@@ -277,6 +294,11 @@ function classifyDocumentForFiling(text, profile, description) {
     return { type: 'insurance', path: '/Personal/Insurance/' };
   if (lower.match(/\b(irs|1099|w-2|w2|tax return|adjusted gross|refund)\b/))
     return { type: 'tax',       path: '/Personal/Financial/Taxes/' };
+  // mortgage/loan before legal — boilerplate like "hereby" appears in mortgage letters
+  if (lower.match(/rocket mortgage|mortgage statement|loan number|autopay confirmation|escrow|homeowner/))
+    return { type: 'housing',   path: '/Personal/Housing/' };
+  if (lower.match(/mortgage|loan statement|student loan/))
+    return { type: 'financial', path: '/Personal/Financial/' };
   if (lower.match(/attorney|court|legal|plaintiff|defendant|judgment|hereby/))
     return { type: 'legal',     path: '/Personal/Legal/' };
   if (lower.match(/lease|landlord|tenant|rental agreement|property/))
@@ -285,8 +307,6 @@ function classifyDocumentForFiling(text, profile, description) {
     return { type: 'auto',      path: '/Personal/Auto/' };
   if (lower.match(/theodore|teddy|daycare|preschool/))
     return { type: 'theodore',  path: '/Personal/Theodore/' };
-  if (lower.match(/mortgage|loan statement|student loan/))
-    return { type: 'financial', path: '/Personal/Financial/' };
 
   return { type: 'document', path: '/Inbox/' };
 }
