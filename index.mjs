@@ -361,16 +361,23 @@ function generateFilename(text, classification, description, ext) {
   else         dateStr = new Date().toISOString().split('T')[0];
 
   let slug;
-  if (description) {
+  const ocrTitle = extractTitleSlug(text);
+  if (ocrTitle) {
+    slug = ocrTitle;
+  } else if (description) {
     slug = description;
   } else {
-    slug = extractTitleSlug(text) || classification.type;
+    slug = classification.type;
   }
-  slug = slug.toLowerCase().trim()
-    .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9\-]/g, '')
-    .replace(/-+/g, '-')
-    .slice(0, 40);
+  slug = slug.trim()
+    .split(/[\s\-_]+/)
+    .filter(w => w.length > 0)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join('_')
+    .replace(/[^a-zA-Z0-9_]/g, '')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/, '')
+    .slice(0, 60);
 
   return `${dateStr}_${slug}.${ext}`;
 }
@@ -423,6 +430,43 @@ function extractTitleSlug(text) {
     if (words.length === 0) return true;
     const stopCount = words.filter(w => stopWords.has(w)).length;
     return stopCount / words.length > 0.5;
+  }
+
+  // Heuristic 0: ALL-CAPS company name + following document-type line.
+  // Why: Financial documents typically lead with "COMPANY NAME\nDocument Type"
+  //      e.g. "ROCKET MORTGAGE\nAutopay Confirmation" or "CHASE BANK\nAccount Summary".
+  //      Combining both lines produces a more descriptive slug than either alone.
+  // What: Finds the first ALL-CAPS line (1–4 words) in first 10 lines as company,
+  //       then looks at the next 1–3 lines for a title-case or mixed-case doc-type
+  //       line (1–5 words, not noise, not stop-word-heavy, not another ALL-CAPS line).
+  // Test: Pass "ROCKET MORTGAGE\nAutopay Confirmation\nDear Customer" →
+  //       expect "ROCKET MORTGAGE Autopay Confirmation".
+  let companyLine = null;
+  let companyIdx  = -1;
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    const line = lines[i];
+    const wc   = wordCount(line);
+    if (wc >= 1 && wc <= 4 && line === line.toUpperCase() && /[A-Z]/.test(line) && !isNoiseLine(line)) {
+      companyLine = line;
+      companyIdx  = i;
+      break;
+    }
+  }
+  if (companyLine !== null) {
+    for (let j = companyIdx + 1; j < Math.min(lines.length, companyIdx + 4); j++) {
+      const next = lines[j];
+      const wc   = wordCount(next);
+      if (
+        wc >= 1 && wc <= 5 &&
+        next !== next.toUpperCase() &&   // not another ALL-CAPS line
+        !isNoiseLine(next) &&
+        !isStopWordHeavy(next)
+      ) {
+        return `${companyLine} ${next}`;
+      }
+    }
+    // Found company but no good doc-type line — return company name alone
+    return companyLine;
   }
 
   // Heuristic 1: ALL-CAPS line (1-6 words) in first 15 lines.
@@ -801,6 +845,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           description: {
             type: "string",
             description: "Optional hint for filename (e.g. 'verizon bill')",
+          },
+        },
+      },
+    },
+    {
+      name: "nextcloud_move",
+      description: "Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning. source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/3320-Chukar/Mortage/old.pdf). Returns success and the new full URL.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          source_path: {
+            type: "string",
+            description: "Current full path in Nextcloud (e.g. /Personal/Housing/3320-Chukar/Mortage/2025-11-15_bad-name.pdf)",
+          },
+          dest_path: {
+            type: "string",
+            description: "New full path in Nextcloud (e.g. /Personal/Housing/3320-Chukar/Mortage/2025-11-15_rocket-mortgage.pdf). Must be in the same folder for a rename.",
+          },
+        },
+        required: ["source_path", "dest_path"],
+      },
+    },
+    {
+      name: "ocr_inbound_media",
+      description: "OCR an image that was attached via the OpenClaw web GUI. When a user attaches a photo or image in the chat, it lands in the media/inbound directory. Call this tool immediately — do not try to use vision. Pass the media_id extracted from the '[media attached: media://inbound/<id>]' marker in the message, or omit it to use the most recently uploaded file. Returns OCR text, engine used, confidence, and word count.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          media_id: {
+            type: "string",
+            description: "The ID from 'media://inbound/<id>' in the message text. If omitted, uses the most recently modified file in the inbound directory.",
+          },
+          file_nextcloud: {
+            type: "boolean",
+            description: "If true, also create a searchable PDF and file to Nextcloud using auto-classification. Default false.",
+          },
+          description: {
+            type: "string",
+            description: "Optional hint for classification and filename if file_nextcloud is true.",
           },
         },
       },
@@ -1583,6 +1666,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               }
               if (pdfResp.ok) {
                 const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
+                if (pdfBuf.length < 5 || pdfBuf.slice(0, 5).toString('ascii') !== '%PDF-') {
+                  throw new Error(`polycr service returned non-PDF response (${pdfBuf.length} bytes)`);
+                }
                 fs.writeFileSync(ocrPdf, pdfBuf);
                 fileToUpload = ocrPdf;
                 pdfMethod = 'polycr';
@@ -1592,7 +1678,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             } catch (_remoteErr) {
               // Fallback: ocrmypdf CLI on the already-merged PDF
               try {
-                await execFileAsync('ocrmypdf', ['--deskew', '--optimize', '1', mergedPdf, ocrPdf]);
+                await execFileAsync('ocrmypdf', ['--rotate-pages', '--deskew', '--optimize', '1', '--image-dpi', '300', mergedPdf, ocrPdf]);
                 fileToUpload = ocrPdf;
                 pdfMethod = 'ocrmypdf-local';
               } catch (_cliErr) {
@@ -1658,6 +1744,110 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       for (const f of allTempFiles) {
         try { execSync(`rm -f ${JSON.stringify(f)}`); } catch (_) {}
       }
+    }
+  }
+
+  if (name === "nextcloud_move") {
+    const { source_path, dest_path } = args;
+    const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
+    const sourceUrl = `${NEXTCLOUD_WEBDAV_BASE}${source_path}`;
+    const destUrl   = `${NEXTCLOUD_WEBDAV_BASE}${dest_path}`;
+
+    const resp = await fetch(sourceUrl, {
+      method: 'MOVE',
+      headers: {
+        Authorization: auth,
+        Destination: destUrl,
+        Overwrite: 'F',
+      },
+    });
+
+    if (!resp.ok && resp.status !== 201 && resp.status !== 204) {
+      throw new Error(`Nextcloud MOVE failed: HTTP ${resp.status}`);
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ success: true, moved_to: destUrl }),
+      }],
+    };
+  }
+
+  if (name === "ocr_inbound_media") {
+    const { media_id, file_nextcloud = false, description } = args || {};
+    const inboundDir = path.join(os.homedir(), '.openclaw', 'media', 'inbound');
+
+    // Find the target file
+    let targetFile = null;
+    if (media_id) {
+      // Search for file whose name contains the media_id
+      const files = fs.readdirSync(inboundDir).filter(f => f.includes(media_id));
+      if (files.length > 0) {
+        targetFile = path.join(inboundDir, files[0]);
+      }
+    }
+    if (!targetFile) {
+      // Fall back to most recently modified file
+      const files = fs.readdirSync(inboundDir)
+        .map(f => ({ name: f, mtime: fs.statSync(path.join(inboundDir, f)).mtimeMs }))
+        .filter(f => /\.(jpg|jpeg|png|tiff?|bmp|webp)$/i.test(f.name))
+        .sort((a, b) => b.mtime - a.mtime);
+      if (files.length === 0) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'No image files found in media/inbound. Please attach an image first.' }) }],
+          isError: true,
+        };
+      }
+      targetFile = path.join(inboundDir, files[0].name);
+    }
+
+    // Run OCR via polycr with fallback
+    const ocrResult = await ocrWithFallback(targetFile);
+
+    if (!file_nextcloud) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            source_file: path.basename(targetFile),
+            text: ocrResult.text || '',
+            engine_used: ocrResult.engine_used,
+            confidence: ocrResult.confidence,
+            word_count: ocrResult.word_count || 0,
+            empty: !ocrResult.text || ocrResult.word_count === 0,
+          }),
+        }],
+      };
+    }
+
+    // file_nextcloud=true: create searchable PDF and upload
+    const timestamp = Date.now();
+    const tmpPdf = `/tmp/inbound_${timestamp}.pdf`;
+    try {
+      const pdfResult = await createSearchablePdfFromJpeg(targetFile, tmpPdf);
+      const classification = classifyDocumentForFiling(ocrResult.text || '', 'doc-bw', description);
+      const filename = generateFilename(ocrResult.text || '', classification, description || '', 'pdf');
+      const ncPath = classification.path || '/Inbox/';
+      await nextcloudUpload(tmpPdf, ncPath, filename);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            source_file: path.basename(targetFile),
+            filed_at: `${ncPath}${filename}`,
+            filename,
+            document_type: classification.type,
+            pdf_method: pdfResult.method,
+            word_count: ocrResult.word_count || 0,
+            ocr_preview: (ocrResult.text || '').slice(0, 300).trim(),
+          }),
+        }],
+      };
+    } finally {
+      try { fs.unlinkSync(tmpPdf); } catch (_) {}
     }
   }
 
