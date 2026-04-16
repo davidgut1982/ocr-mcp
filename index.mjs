@@ -22,8 +22,8 @@ const SCANNERS = {
   'hp-officejet-5740': process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080',
   'canon-mf741c':      'airscan:e0:Canon MF741C',
 };
-// Default scanner (backward compat)
-const DEFAULT_SCANNER = SCANNERS['hp-officejet-5740'];
+// Default scanner
+const DEFAULT_SCANNER = SCANNERS['canon-mf741c'];
 
 const NEXTCLOUD_URL = process.env.NEXTCLOUD_URL || 'https://nextcloud.shifting-ground.link';
 const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER || 'david.gutowsky';
@@ -701,7 +701,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "scan_document",
       description:
-        "Scan a document using scanimage. Defaults to hp-officejet-5740 (escl:http://192.168.1.183:8080). Returns success, path, resolution, mode, source, and scanner on success.",
+        "Scan a single page to a local file path using scanimage. Low-level tool — use scan_and_file instead for the full pipeline (OCR + PDF + Nextcloud). Returns success, path, scanner used.",
       inputSchema: {
         type: "object",
         properties: {
@@ -726,7 +726,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           scanner: {
             type: "string",
             enum: ["hp-officejet-5740", "canon-mf741c"],
-            description: "Which scanner to use (default: hp-officejet-5740)",
+            description: "Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). hp-officejet-5740 = HP Officejet 5740 (backup flatbed). Default: canon-mf741c",
           },
         },
         required: ["output_path"],
@@ -758,18 +758,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "scan_and_file",
       description:
-        "Atomic pipeline: scan document → OCR → create searchable PDF → upload to Nextcloud. Executes the full pipeline in one call. Returns what was scanned, filename used, and where it was filed.",
+        "Scan a document and file it to Nextcloud automatically. Full pipeline: scan → OCR → searchable PDF → auto-classify → upload. Only `profile` is required; all other parameters have defaults. Default scanner is canon-mf741c. Returns filename, filed_at path, pdf_method, word_count, and confidence.",
       inputSchema: {
         type: "object",
         properties: {
           profile: {
             type: "string",
             enum: ["doc-bw", "doc-bw-adf", "doc-color", "receipt", "id-card", "photo", "event"],
-            description: "Scanning profile to use",
+            description: "Scanning profile. doc-bw-adf = Canon ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.",
           },
           description: {
             type: "string",
-            description: "Optional hint for filename/classification (e.g. 'verizon bill', 'theodore immunization')",
+            description: "Optional hint for filename and classification (e.g. 'verizon bill april 2026', 'theodore immunization'). Improves auto-naming accuracy.",
           },
           nextcloud_path: {
             type: "string",
@@ -781,15 +781,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           separate_pages: {
             type: "boolean",
-            description: "ADF only: file each page as a separate document instead of merging into one PDF (default false)",
+            description: "ADF only: file each ADF page as a separate document. Default false (merge all pages into one PDF).",
           },
           scanner: {
             type: "string",
             enum: ["hp-officejet-5740", "canon-mf741c"],
-            description: "Which scanner to use (default: hp-officejet-5740)",
+            description: "Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). hp-officejet-5740 = HP Officejet 5740 (backup flatbed). Default: canon-mf741c",
           },
         },
         required: ["profile"],
+      },
+    },
+    {
+      name: "quick_scan",
+      description: "Scan whatever is in the Canon MF741C ADF (or flatbed if ADF empty) and file to Nextcloud automatically. Zero configuration needed — uses Canon MF741C + doc-bw-adf profile + auto-classification. Returns filed_at path and OCR preview.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          description: {
+            type: "string",
+            description: "Optional hint for filename (e.g. 'verizon bill')",
+          },
+        },
       },
     },
   ],
@@ -1137,7 +1150,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       resolution = 300,
       mode = "Color",
       source = "Flatbed",
-      scanner = 'hp-officejet-5740',
+      scanner = 'canon-mf741c',
     } = args;
     const deviceName = SCANNERS[scanner] || DEFAULT_SCANNER;
 
@@ -1286,16 +1299,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
-  if (name === "scan_and_file") {
+  if (name === "scan_and_file" || name === "quick_scan") {
     // Why: Executes the full scan→OCR→PDF→upload pipeline atomically so a context
     //      bootstrap reset cannot interrupt it between steps.
     // What: Scans via scanimage, OCRs via polycr (Tesseract fallback), creates a
     //       searchable PDF via ocrmypdf service (Tesseract fallback), uploads to
     //       Nextcloud WebDAV, cleans up temp files, returns a summary object.
+    //       quick_scan is a zero-config alias: canon-mf741c + doc-bw-adf defaults.
     // Test: Mock execSync for scanimage success; mock fetch for polycr and ocrmypdf;
     //       assert result.success is true, result.filed_at is non-null, and temp
     //       files are deleted by the end of the call.
-    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride, separate_pages = false, scanner = 'hp-officejet-5740' } = args;
+    const resolvedArgs = name === "quick_scan"
+      ? { profile: 'doc-bw-adf', scanner: 'canon-mf741c', ...(args.description ? { description: args.description } : {}) }
+      : args;
+    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride, separate_pages = false, scanner = 'canon-mf741c' } = resolvedArgs;
     const deviceName = SCANNERS[scanner] || DEFAULT_SCANNER;
     const params = PROFILE_PARAMS[profile];
     if (!params) throw new Error(`Unknown profile: ${profile}`);
