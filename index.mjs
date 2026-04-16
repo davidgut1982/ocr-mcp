@@ -286,6 +286,31 @@ function classifyDocumentForFiling(text, profile, description) {
     }
   }
 
+  // Check custom rules — ordered after properties but before generic heuristics
+  // Why: Allows user-defined keyword→path mappings (e.g. vehicles, legal matters, tax years)
+  //      without requiring code changes; supports {year} placeholder via detect_year.
+  // What: Iterates custom_rules; first keyword match returns immediately with rule.path
+  //       (after substituting the most recent 4-digit year if detect_year is set).
+  // Test: Add a rule with keywords:["subaru"] path:"/Auto/"; pass text "subaru outback";
+  //       assert type==="auto" and path==="/Auto/".
+  for (const rule of (routingRules.custom_rules || [])) {
+    const keywords = rule.keywords || [];
+    if (keywords.some(kw => lower.includes(kw.toLowerCase()))) {
+      let rulePath = rule.path;
+      if (rule.detect_year && rulePath.includes('{year}')) {
+        // Extract year from OCR text; prefer most recent plausible year (2000–currentYear+1)
+        const yearMatch = text.match(/\b(20\d{2})\b/g);
+        const currentYear = new Date().getFullYear();
+        const years = (yearMatch || [])
+          .map(y => parseInt(y))
+          .filter(y => y >= 2000 && y <= currentYear + 1);
+        const year = years.length > 0 ? Math.max(...years) : currentYear;
+        rulePath = rulePath.replace('{year}', year);
+      }
+      return { type: rule.type || 'document', path: rulePath };
+    }
+  }
+
   if (lower.match(/invoice|receipt|total\s*\$|subtotal|thank you for your (purchase|order)/))
     return { type: 'receipt',   path: '/Personal/Financial/Receipts/' };
   if (lower.match(/prescription|diagnosis|patient|physician|hospital|lab result|immunization/))
