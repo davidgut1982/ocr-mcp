@@ -30,6 +30,13 @@ const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER || 'david.gutowsky';
 const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD || '';
 const NEXTCLOUD_WEBDAV_BASE = `${NEXTCLOUD_URL}/remote.php/dav/files/${NEXTCLOUD_USER}`;
 
+// LiteLLM proxy — OpenAI-compatible endpoint on the local network.
+// Used for LLM-based OCR reconciliation: all engine outputs are fed to the
+// LLM and it returns the best possible merged transcription.
+const LITELLM_URL = process.env.LITELLM_URL || 'http://192.168.1.19:4000/v1/chat/completions';
+const LITELLM_KEY = process.env.LITELLM_KEY || 'sk-litellm-openclaw';
+const LITELLM_MODEL = process.env.LITELLM_MODEL || 'auto';
+
 // Helper: derive default output path from input path
 function defaultOutputPath(filePath) {
   const dir = path.dirname(filePath);
@@ -160,12 +167,93 @@ function pickBestPolycr(data) {
   return best;
 }
 
+// Why: Feeds all OCR engine outputs to an LLM so it can reconcile disagreements,
+//      correct garbled characters, and reconstruct ambiguous proper nouns (e.g.
+//      "DeCraenes Service Center" from engines that disagree on capitalisation).
+// What: Formats each engine's text as a numbered block, sends them to the LiteLLM
+//       proxy with a reconciliation prompt, and returns the LLM's merged transcription.
+//       Returns null on any error so callers can fall back gracefully.
+// Test: Mock fetch to return { choices:[{message:{content:"reconciled text"}}] };
+//       assert return value is "reconciled text".
+//       Mock fetch to throw; assert return value is null.
+async function reconcileOcrWithLLM(engineResults) {
+  if (!engineResults || engineResults.length < 2) return null;
+
+  const versionsText = engineResults
+    .map((r, i) => `--- Engine ${i + 1} (${r.engine}) ---\n${r.text.trim()}`)
+    .join('\n\n');
+
+  const prompt =
+    `You are a document transcription assistant. The following are ${engineResults.length} OCR readings of the same physical document page, each produced by a different OCR engine. Each version may have recognition errors: garbled characters, wrong capitalisation, missed words, or split tokens.\n\n` +
+    `Your task: reconcile these into the single most accurate transcription of what the document actually says. Use all versions as evidence — prefer readings that are consistent across engines, and use context to resolve ambiguities (e.g. if two engines read "DeCraenes" and one reads "DeCraenee", the correct spelling is almost certainly "DeCraenes"). Preserve proper nouns, company names, dates, dollar amounts, and structured layout (line breaks, columns, addresses).\n\n` +
+    `Output ONLY the reconciled document text. Do not add commentary, headers, labels, or explanations. Preserve the original document structure and line breaks as faithfully as possible.\n\n` +
+    versionsText;
+
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 30000);
+    let resp;
+    try {
+      resp = await fetch(LITELLM_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${LITELLM_KEY}`,
+        },
+        body: JSON.stringify({
+          model: LITELLM_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 4096,
+          temperature: 0,
+        }),
+        signal: ac.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content || typeof content !== 'string' || content.trim().length === 0) return null;
+    return content.trim();
+  } catch (_) {
+    return null;
+  }
+}
+
 // Why: Provides transparent OCR with automatic fallback so callers don't need to manage service availability.
-// What: Tries polycr first; falls back to local Tesseract if polycr is unreachable or returns no results.
-// Test: Mock callPolycr to return null result; assert engine_used is 'tesseract-local' and fallback_reason is set.
+// What: Tries polycr first; if 2+ engines returned results, feeds them all to the LLM for reconciliation
+//       (best possible text). Falls back to consensus scoring (pickBestPolycr) if the LLM is unavailable.
+//       Falls back to local Tesseract if polycr is unreachable.
+// Test: Mock callPolycr to return two engine results; mock reconcileOcrWithLLM to return "reconciled";
+//       assert engine_used is 'llm-reconciled' and text is "reconciled".
+//       Mock reconcileOcrWithLLM to return null; assert engine_used is the consensus engine name.
+//       Mock callPolycr to return null result; assert engine_used is 'tesseract-local'.
 async function ocrWithFallback(filePath) {
   const { result, fallback_reason } = await callPolycr(filePath);
   if (result) {
+    // Collect all engine results that produced usable text
+    const engineResults = (result.results || [])
+      .filter(r => r && typeof r.text === 'string' && !r.error && countWords(r.text) > 0)
+      .map(r => ({ engine: r.engine || 'unknown', text: r.text }));
+
+    // Try LLM reconciliation when 2+ engines produced output — this gives the
+    // highest-quality text by letting the model resolve disagreements.
+    if (engineResults.length >= 2) {
+      const reconciled = await reconcileOcrWithLLM(engineResults);
+      if (reconciled && countWords(reconciled) > 0) {
+        return {
+          text: reconciled,
+          engine_used: 'llm-reconciled',
+          confidence: 0.95,
+          word_count: countWords(reconciled),
+          empty: false,
+          fallback_reason: undefined,
+        };
+      }
+    }
+
+    // LLM unavailable or only 1 engine — fall back to consensus scoring
     const best = pickBestPolycr(result);
     if (best) {
       const wc = countWords(best.text);
