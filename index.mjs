@@ -382,21 +382,16 @@ function classifyDocumentForFiling(text, profile, description) {
     }
   } catch (_) {}
 
-  // Check property-based routing first (most specific — beats all generic keyword checks)
-  for (const prop of (routingRules.properties || [])) {
-    const keywords = prop.keywords || [prop.address];
-    if (keywords.some(kw => lower.includes(kw.toLowerCase()))) {
-      return { type: 'housing', path: prop.path };
-    }
-  }
-
-  // Check custom rules — ordered after properties but before generic heuristics
-  // Why: Allows user-defined keyword→path mappings (e.g. vehicles, legal matters, tax years)
-  //      without requiring code changes; supports {year} placeholder via detect_year.
+  // Check custom rules BEFORE property rules.
+  // Why: Many documents are mailed to the customer's home address, so a property
+  //      address match (e.g. "3320 Chukar") would fire on an auto repair invoice
+  //      addressed to David before the "subaru" vehicle rule ever runs. Custom rules
+  //      represent what the document IS about; property rules represent where the
+  //      customer lives — the former should win.
   // What: Iterates custom_rules; first keyword match returns immediately with rule.path
   //       (after substituting the most recent 4-digit year if detect_year is set).
-  // Test: Add a rule with keywords:["subaru"] path:"/Auto/"; pass text "subaru outback";
-  //       assert type==="auto" and path==="/Auto/".
+  // Test: Add a rule with keywords:["subaru"] path:"/Auto/"; pass text containing both
+  //       "subaru" and "3320 chukar"; assert type==="auto" and path==="/Auto/".
   for (const rule of (routingRules.custom_rules || [])) {
     const keywords = rule.keywords || [];
     if (keywords.some(kw => lower.includes(kw.toLowerCase()))) {
@@ -412,6 +407,17 @@ function classifyDocumentForFiling(text, profile, description) {
         rulePath = rulePath.replace('{year}', year);
       }
       return { type: rule.type || 'document', path: rulePath };
+    }
+  }
+
+  // Check property-based routing after custom rules.
+  // Why: Property address keywords (e.g. "3320 chukar") appear on many documents simply
+  //      because they are the customer's mailing address — they should only route to a
+  //      property folder when no more-specific document-type rule matched first.
+  for (const prop of (routingRules.properties || [])) {
+    const keywords = prop.keywords || [prop.address];
+    if (keywords.some(kw => lower.includes(kw.toLowerCase()))) {
+      return { type: 'housing', path: prop.path };
     }
   }
 
@@ -480,8 +486,18 @@ function generateFilename(text, classification, description, ext) {
   }
   slug = slug.trim()
     .split(/[\s\-_]+/)
-    .filter(w => w.length > 0)
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .map(w => {
+      // Strip leading/trailing non-alphanumeric chars before title-casing so that
+      // tokens like "Inc." become "Inc" and "C." becomes "C" (then filtered below).
+      // This prevents trailing punctuation from gluing adjacent tokens (e.g. "C.Center"
+      // staying as one token and producing "Ccenter" after the non-alnum strip).
+      const clean = w.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, '');
+      if (!clean) return '';
+      return clean.charAt(0).toUpperCase() + clean.slice(1).toLowerCase();
+    })
+    // Drop empty strings and single-character tokens — isolated letters are almost always
+    // OCR noise (a stray "C" split off from "Center", an ampersand residue, etc.)
+    .filter(w => w.length > 1)
     .join('_')
     .replace(/[^a-zA-Z0-9_]/g, '')
     .replace(/_+/g, '_')
