@@ -30,6 +30,13 @@ const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER || 'david.gutowsky';
 const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD || '';
 const NEXTCLOUD_WEBDAV_BASE = `${NEXTCLOUD_URL}/remote.php/dav/files/${NEXTCLOUD_USER}`;
 
+// Direct eSCL base URL for the Canon MF741C.
+// Used for multi-page ADF scanning — scanimage's per-call loop and --batch mode both
+// have issues with eSCL: each new SANE session causes the Canon to feed ALL remaining
+// pages but only return page 1. The eSCL HTTP API gives per-page control via
+// NextDocument fetches within a single job.
+const CANON_ESCL_BASE = process.env.CANON_ESCL_BASE || 'http://192.168.1.141';
+
 // LiteLLM proxy — OpenAI-compatible endpoint on the local network.
 // Used for LLM-based OCR reconciliation: all engine outputs are fed to the
 // LLM and it returns the best possible merged transcription.
@@ -627,6 +634,92 @@ function extractTitleSlug(text) {
     .map(t => t.toLowerCase().replace(/[^a-z0-9]/g, ''))
     .filter(t => t.length > 2 && !stopWords.has(t));
   return tokens.slice(0, 5).join(' ') || '';
+}
+
+// Why: Scans all ADF pages via the Canon eSCL HTTP API directly, bypassing scanimage.
+//      scanimage (both per-call loop and --batch) behaves incorrectly with eSCL: each
+//      new SANE session triggers a new eSCL scan job, causing the Canon to feed the
+//      entire ADF stack but only deliver page 1 per job. Calling NextDocument within a
+//      single job gives proper per-page control.
+// What: POSTs a ScanJobs request, then GETs NextDocument in a loop until 404 (ADF
+//       empty). Each page is saved as a numbered JPEG. Cleans up the eSCL job on exit.
+//       Returns array of absolute JPEG paths in page order.
+// Test: Mock fetch to return 201 with Location header, then 200 for 2 pages, then 404;
+//       assert return value has 2 file paths and both files contain the mocked JPEG data.
+async function scanAdfViaEscl(timestamp, colorMode, resolution) {
+  const scanXml = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03"',
+    '                   xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">',
+    '  <pwg:Version>2.63</pwg:Version>',
+    '  <scan:Intent>Document</scan:Intent>',
+    '  <pwg:ScanRegions pwg:MustHonor="false">',
+    '    <pwg:ScanRegion>',
+    '      <pwg:Height>3300</pwg:Height>',
+    '      <pwg:Width>2550</pwg:Width>',
+    '      <pwg:XOffset>0</pwg:XOffset>',
+    '      <pwg:YOffset>0</pwg:YOffset>',
+    '    </pwg:ScanRegion>',
+    '  </pwg:ScanRegions>',
+    '  <pwg:InputSource>Feeder</pwg:InputSource>',
+    `  <scan:ColorMode>${colorMode === 'Color' ? 'RGB24' : 'Grayscale8'}</scan:ColorMode>`,
+    `  <scan:XResolution>${resolution}</scan:XResolution>`,
+    `  <scan:YResolution>${resolution}</scan:YResolution>`,
+    '  <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>',
+    '</scan:ScanSettings>',
+  ].join('\n');
+
+  // Create scan job
+  const createResp = await fetch(`${CANON_ESCL_BASE}/eSCL/ScanJobs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml' },
+    body: scanXml,
+  });
+
+  if (!createResp.ok) {
+    const body = await createResp.text().catch(() => '');
+    throw new Error(`eSCL job creation failed: HTTP ${createResp.status} — ${body.slice(0, 200)}`);
+  }
+
+  const location = createResp.headers.get('location');
+  if (!location) throw new Error('eSCL: no Location header in job creation response');
+  const jobUrl = location.startsWith('http') ? location : `${CANON_ESCL_BASE}${location}`;
+
+  const pageJpegs = [];
+  try {
+    for (let pageNum = 1; pageNum <= 99; pageNum++) {
+      // 90s per-page timeout — Canon can be slow to scan and compress
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 90000);
+      let pageResp;
+      try {
+        pageResp = await fetch(`${jobUrl}/NextDocument`, { signal: ac.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      // 404 = ADF empty (job complete); 503 = scanner busy / job cancelled
+      if (pageResp.status === 404 || pageResp.status === 503) break;
+
+      if (!pageResp.ok) {
+        // Unexpected error mid-batch — if we have pages already, treat as done
+        if (pageJpegs.length > 0) break;
+        throw new Error(`eSCL NextDocument failed: HTTP ${pageResp.status}`);
+      }
+
+      const pageData = Buffer.from(await pageResp.arrayBuffer());
+      if (pageData.length === 0) break;
+
+      const pageFile = `/tmp/scan_${timestamp}_p${pageNum}.jpg`;
+      fs.writeFileSync(pageFile, pageData);
+      pageJpegs.push(pageFile);
+    }
+  } finally {
+    // Always clean up the eSCL job — fire-and-forget, errors don't matter
+    fetch(jobUrl, { method: 'DELETE' }).catch(() => {});
+  }
+
+  return pageJpegs;
 }
 
 // Why: Sends a JPEG to the ocrmypdf service and writes the resulting PDF to outPath.
@@ -1681,58 +1774,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         //       separate_pages=false assert result.pages===2 and result.success===true;
         //       with separate_pages=true assert results.length===2.
 
-        // Step 1: Collect all page JPEGs from ADF using --batch mode.
+        // Step 1: Collect all page JPEGs from ADF using direct eSCL HTTP API.
         //
-        // Why --batch instead of a per-call loop:
-        //   With eSCL/AirScan scanners (Canon MF741C via airscan backend), each new
-        //   `scanimage` invocation opens a fresh eSCL scan job. The Canon feeds ALL
-        //   remaining ADF pages for that job, but since JPEG is single-frame, only
-        //   page 1 is written. By the time the loop tries page 2 the feeder is empty.
-        //   `--batch` keeps one SANE session open and calls sane_start() per page
-        //   internally, so each page is fetched correctly before the next ejects.
+        // Why eSCL instead of scanimage:
+        //   Each new `scanimage` invocation creates a fresh eSCL scan job. The Canon
+        //   feeds ALL remaining ADF pages for that job, but since JPEG is single-frame,
+        //   only page 1 is written per invocation. `scanimage --batch` was tested and
+        //   confirmed non-functional with the airscan backend (scanner reports 4 images
+        //   completed but no files are written to disk).
         //
-        // What: Runs a single scanimage --batch command that writes numbered JPEGs
-        //   (/tmp/scan_TIMESTAMP_p1.jpg, _p2.jpg, …). After the command finishes
-        //   (exit 0 or feeder-empty non-zero), we discover the written files in order.
+        //   Direct eSCL: one POST /eSCL/ScanJobs creates a job, then repeated GET
+        //   {jobUrl}/NextDocument fetches each page in sequence until the feeder
+        //   returns 404 or 503 (end of feed). This is the only reliable multi-page
+        //   ADF approach for the Canon MF741C.
 
-        // Pre-scan progress notification resets the MCP client timeout so Canon
-        // warmup time (several seconds before the first page feeds) doesn't kill us.
-        await sendProgress(0, -1, 'ADF batch scan starting — warming up scanner');
+        await sendProgress(0, -1, 'ADF scan starting — warming up scanner');
 
-        const batchPattern = `/tmp/scan_${timestamp}_p%d.jpg`;
-
-        try {
-          execSync(
-            `scanimage --device-name=${JSON.stringify(deviceName)} --batch=${JSON.stringify(batchPattern)} --batch-start=1 --batch-count=99 --format=jpeg --resolution=300 --mode=${JSON.stringify(scanMode)} --source=${JSON.stringify(params.source)}`,
-            { timeout: 300000 }
-          );
-        } catch (batchErr) {
-          // scanimage --batch exits non-zero when the ADF is exhausted — that is
-          // expected and not an error as long as at least one file was written.
-          // A real error (no files written, timeout before first page) is handled below.
-          const isTimeout = batchErr.message && batchErr.message.includes('timed out');
-          if (isTimeout) {
-            // Check whether we got any files before the timeout
-            const firstPage = `/tmp/scan_${timestamp}_p1.jpg`;
-            if (!fs.existsSync(firstPage) || fs.statSync(firstPage).size === 0) {
-              throw new Error('Scanner timed out before any pages were captured. Check that the Canon is awake and the ADF is loaded.');
-            }
-            // Otherwise fall through and use whatever pages were captured
-          }
-          // All other exits (including feeder-empty exit codes) are treated as
-          // normal end-of-batch — discover the files written below.
-        }
-
-        // Discover pages: walk p1, p2, … until a file is missing or empty.
-        const pageJpegs = [];
-        for (let n = 1; n <= 99; n++) {
-          const f = `/tmp/scan_${timestamp}_p${n}.jpg`;
-          if (!fs.existsSync(f)) break;
-          const stat = fs.statSync(f);
-          if (stat.size === 0) break; // zero-byte means scanner stopped here
-          pageJpegs.push(f);
-          allTempFiles.push(f);
-        }
+        const pageJpegs = await scanAdfViaEscl(timestamp, scanMode, 300);
+        for (const f of pageJpegs) allTempFiles.push(f);
 
         if (pageJpegs.length === 0) {
           return {
