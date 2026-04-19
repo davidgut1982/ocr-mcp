@@ -1256,7 +1256,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
       execSync(
-        `scanimage --device-name=${JSON.stringify(deviceName)} --format=${format} --output-file=${JSON.stringify(output_path)} --resolution=${resolution} --mode=${JSON.stringify(mode)} --source=${JSON.stringify(source)}`
+        `scanimage --device-name=${JSON.stringify(deviceName)} --format=${format} --output-file=${JSON.stringify(output_path)} --resolution=${resolution} --mode=${JSON.stringify(mode)} --source=${JSON.stringify(source)}`,
+        { timeout: 120000 }
       );
     } catch (e) {
       return {
@@ -1536,22 +1537,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           try {
             execSync(
               `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(scanMode)} --source=${JSON.stringify(params.source)}`,
-              { timeout: 60000 }
+              { timeout: 120000 }
             );
           } catch (scanErr) {
-            // SANE exit code 7 / "No documents in feeder" / "Document feeder empty"
-            // means normal end-of-feeder — not an error worth reporting.
-            const msg = (scanErr.stderr || scanErr.message || '').toString();
-            if (
-              msg.includes('No documents') ||
-              msg.includes('Document feeder empty') ||
-              (scanErr.status === 7)
-            ) {
-              break; // feeder exhausted — stop the loop
+            const isFeederEmpty =
+              (scanErr.stderr && (scanErr.stderr.includes('No documents') || scanErr.stderr.includes('Document feeder empty'))) ||
+              (scanErr.message && (scanErr.message.includes('No documents') || scanErr.message.includes('Document feeder empty'))) ||
+              scanErr.status === 7;
+
+            const isTimeout = scanErr.message && scanErr.message.includes('timed out');
+
+            if (isFeederEmpty) {
+              break;
+            } else if (isTimeout && pageJpegs.length > 0) {
+              break; // scanner timed out mid-batch but we have pages — treat as feeder done
+            } else if (isTimeout && pageJpegs.length === 0) {
+              throw new Error('Scanner timed out before any pages were captured. Check that the Canon is awake and the ADF is loaded.');
+            } else {
+              throw scanErr;
             }
-            throw scanErr; // unexpected scan error — propagate
           }
 
+          const stat = fs.statSync(tmpJpeg);
+          if (stat.size === 0) {
+            throw new Error(`scanimage produced a zero-byte file for page ${pageJpegs.length + 1}. Possible eSCL/AirScan firmware issue or feeder jam.`);
+          }
           pageJpegs.push(tmpJpeg);
         }
 
@@ -1727,7 +1737,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Step 1: Scan
         execSync(
           `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(scanMode)} --source=${JSON.stringify(params.source)}`,
-          { timeout: 60000 }
+          { timeout: 120000 }
         );
 
         const result = await processSinglePage(tmpJpeg, tmpPdf, 'p1');
