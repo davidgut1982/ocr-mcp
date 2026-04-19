@@ -891,8 +891,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
+
+  // Why: Resets the MCP SDK client's 60s timeout window so long-running ADF scans
+  //      are not cancelled mid-operation. Each notification extends the window.
+  // What: Sends a notifications/progress message via the request-scoped sendNotification.
+  //       Uses the progressToken from the request _meta when present; falls back to a
+  //       generated string token so the notification is always well-formed.
+  // Test: Spy on extra.sendNotification; call sendProgress(1, 5); assert it was called
+  //       with method 'notifications/progress' and params.progress === 1.
+  async function sendProgress(progress, total = -1, message = '') {
+    try {
+      const progressToken = request.params._meta?.progressToken ?? `scan_progress_${Date.now()}`;
+      await extra.sendNotification({
+        method: 'notifications/progress',
+        params: { progressToken, progress, total, ...(message ? { message } : {}) },
+      });
+    } catch (_) {
+      // Progress notification failure is non-fatal — never abort the scan.
+    }
+  }
 
   if (name === "ocr_image_local") {
     const { file_path, preprocess = false } = args;
@@ -1529,6 +1548,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const pageJpegs = [];
         let pageNum = 0;
 
+        // Emit an initial progress notification to reset the client timeout during
+        // Canon warmup (the scanner takes several seconds before the first page feeds).
+        await sendProgress(0, -1, 'ADF scan starting — warming up scanner');
+
         while (true) {
           pageNum += 1;
           const tmpJpeg = `/tmp/scan_${timestamp}_p${pageNum}.jpg`;
@@ -1571,6 +1594,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             throw new Error(`scanimage produced a zero-byte file for page ${pageJpegs.length + 1}. Possible eSCL/AirScan firmware issue or feeder jam.`);
           }
           pageJpegs.push(tmpJpeg);
+          // Reset the client 60s timeout window after each successfully scanned page.
+          await sendProgress(pageJpegs.length, -1, `Page ${pageJpegs.length} scanned`);
         }
 
         if (pageJpegs.length === 0) {
