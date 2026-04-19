@@ -813,6 +813,28 @@ async function nextcloudUpload(localPath, nextcloudPath, filename) {
   return url;
 }
 
+// Why: Needed by split_and_refile to fetch an existing Nextcloud PDF to /tmp.
+// What: HTTP GET via WebDAV, writes buffer to outputPath.
+async function nextcloudDownload(ncFullPath, outputPath) {
+  const url = `${NEXTCLOUD_WEBDAV_BASE}${ncFullPath}`;
+  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
+  const resp = await fetch(url, { method: 'GET', headers: { Authorization: auth } });
+  if (!resp.ok) throw new Error(`Nextcloud download failed: HTTP ${resp.status} for ${ncFullPath}`);
+  fs.writeFileSync(outputPath, Buffer.from(await resp.arrayBuffer()));
+}
+
+// Why: Needed by split_and_refile to remove the original merged PDF after refiling.
+// What: WebDAV DELETE — returns true on success, throws on unexpected error.
+async function nextcloudDelete(ncFullPath) {
+  const url = `${NEXTCLOUD_WEBDAV_BASE}${ncFullPath}`;
+  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
+  const resp = await fetch(url, { method: 'DELETE', headers: { Authorization: auth } });
+  if (!resp.ok && resp.status !== 204 && resp.status !== 404) {
+    throw new Error(`Nextcloud DELETE failed: HTTP ${resp.status}`);
+  }
+  return true;
+}
+
 // --- end scan_and_file helpers ---
 
 const server = new Server(
@@ -1095,6 +1117,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["source_path", "dest_path"],
+      },
+    },
+    {
+      name: "split_and_refile",
+      description: "Split an already-filed multi-page PDF in Nextcloud into individual pages, OCR and classify each page, and refile them as separate documents. Use this when a batch ADF scan was merged into one PDF but the pages should have been filed individually. Returns an array of per-page results.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          source_path: {
+            type: "string",
+            description: "Full Nextcloud path of the PDF to split, including filename. Example: /Personal/Auto/Subaru Outback/2026-04-19_Decraenes_Service_Center_Inc.pdf",
+          },
+          delete_original: {
+            type: "boolean",
+            description: "Delete the original merged PDF from Nextcloud after all pages are successfully refiled. Default: false. Only deletes if every page succeeded.",
+          },
+          description: {
+            type: "string",
+            description: "Optional hint for classification and filename generation, applied to every page (e.g. 'DeCraenes invoice').",
+          },
+        },
+        required: ["source_path"],
       },
     },
     {
@@ -2012,6 +2056,192 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         text: JSON.stringify({ success: true, moved_to: destUrl }),
       }],
     };
+  }
+
+  if (name === "split_and_refile") {
+    const { source_path, delete_original = false, description } = args || {};
+    const timestamp = Date.now();
+    const allTempFiles = [];
+
+    async function sendProgress(progress, total = -1, message = '') {
+      const progressToken = request.params._meta?.progressToken ?? `split_progress_${timestamp}`;
+      try {
+        await extra.sendNotification({
+          method: 'notifications/progress',
+          params: { progressToken, progress, total, ...(message ? { message } : {}) },
+        });
+      } catch (_) {}
+    }
+
+    try {
+      // Validate
+      if (!source_path || typeof source_path !== 'string') {
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'source_path is required.' }) }], isError: true };
+      }
+      if (!source_path.toLowerCase().endsWith('.pdf')) {
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'source_path must point to a .pdf file.' }) }], isError: true };
+      }
+
+      // Download PDF from Nextcloud
+      await sendProgress(0, -1, 'Downloading PDF from Nextcloud');
+      const sourcePdf = `/tmp/split_${timestamp}_source.pdf`;
+      allTempFiles.push(sourcePdf);
+      try {
+        await nextcloudDownload(source_path, sourcePdf);
+      } catch (dlErr) {
+        const msg = dlErr.message.includes('404') || dlErr.message.includes('HTTP 404')
+          ? `File not found at ${source_path}`
+          : `Download failed: ${dlErr.message}`;
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: msg }) }], isError: true };
+      }
+
+      // Get page count via ImageMagick identify
+      let pageCount;
+      try {
+        const identifyOut = execSync(`identify ${JSON.stringify(sourcePdf)} 2>/dev/null | wc -l`, { timeout: 30000 }).toString().trim();
+        pageCount = parseInt(identifyOut, 10);
+        if (!pageCount || pageCount < 1) throw new Error('identify returned 0');
+      } catch (_) {
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Could not determine page count — is this a valid PDF?' }) }], isError: true };
+      }
+
+      // Single-page edge case
+      if (pageCount === 1 && !delete_original) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            success: false,
+            error: 'This PDF has only 1 page — nothing to split. To move it to a different folder use ocr__nextcloud_move instead.',
+            pages: 1,
+          }) }],
+        };
+      }
+
+      await sendProgress(0, pageCount, `${pageCount} page(s) found — starting split`);
+
+      const usedFilenames = new Set();
+      const results = [];
+      let anyFailed = false;
+
+      for (let i = 1; i <= pageCount; i++) {
+        await sendProgress(i - 1, pageCount, `Processing page ${i} of ${pageCount}`);
+
+        const splitPdf  = `/tmp/split_${timestamp}_p${i}.pdf`;
+        const splitJpeg = `/tmp/split_${timestamp}_p${i}.jpg`;
+        const ocrPdf    = `/tmp/split_${timestamp}_p${i}_ocr.pdf`;
+        allTempFiles.push(splitPdf, splitJpeg, ocrPdf);
+
+        try {
+          // Extract single page via Ghostscript
+          execSync(
+            `gs -dBATCH -dNOPAUSE -q -sDEVICE=pdfwrite -dFirstPage=${i} -dLastPage=${i} -sOutputFile=${JSON.stringify(splitPdf)} ${JSON.stringify(sourcePdf)}`,
+            { timeout: 60000 }
+          );
+
+          // Convert to JPEG for OCR
+          execSync(
+            `convert -density 300 ${JSON.stringify(splitPdf)}[0] -quality 85 ${JSON.stringify(splitJpeg)}`,
+            { timeout: 30000 }
+          );
+
+          // OCR
+          let ocrResult = await ocrWithFallback(splitJpeg);
+          let ocrText = ocrResult.text || '';
+          let wordCount = ocrResult.word_count || 0;
+          let confidence = ocrResult.confidence || 0;
+
+          // Low-confidence retry with image enhancement
+          if (wordCount < 10) {
+            const enhanced = splitJpeg.replace('.jpg', '_enhanced.jpg');
+            allTempFiles.push(enhanced);
+            try {
+              execSync(`convert ${JSON.stringify(splitJpeg)} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
+              const enhResult = await ocrWithFallback(enhanced);
+              if ((enhResult.word_count || 0) > wordCount) {
+                ocrText = enhResult.text || '';
+                wordCount = enhResult.word_count || 0;
+                confidence = enhResult.confidence || 0;
+              }
+            } catch (_) {}
+          }
+
+          // Classify and generate filename
+          const classification = classifyDocumentForFiling(ocrText, 'doc-bw', description);
+          let filename = generateFilename(ocrText, classification, description, 'pdf');
+
+          // Collision safety across pages
+          let attempt = 0;
+          while (usedFilenames.has(filename)) {
+            attempt++;
+            const base = filename.replace(/\.pdf$/, '');
+            filename = `${base}_p${i}${attempt > 1 ? `_${attempt}` : ''}.pdf`;
+          }
+          usedFilenames.add(filename);
+
+          // Create searchable PDF (pass split PDF directly — polycr + ocrmypdf handle PDF input)
+          const pdfResult = await createSearchablePdfFromJpeg(splitPdf, ocrPdf);
+
+          // Upload
+          const ncPath = classification.path || '/Inbox/';
+          await nextcloudUpload(pdfResult.path, ncPath, filename);
+
+          const inboxFlag = ncPath === '/Inbox/' ? 'Could not classify — filed to /Inbox/' : undefined;
+
+          results.push({
+            page: i,
+            success: true,
+            filename,
+            filed_at: `${ncPath}${filename}`,
+            document_type: classification.type,
+            pdf_method: pdfResult.method,
+            word_count: wordCount,
+            confidence: Math.round(confidence * 100) / 100,
+            ocr_preview: ocrText.slice(0, 200).trim() || null,
+            ...(inboxFlag ? { note: inboxFlag } : {}),
+          });
+
+        } catch (pageErr) {
+          anyFailed = true;
+          results.push({ page: i, success: false, error: pageErr.message });
+        }
+      }
+
+      // Delete original if requested and all pages succeeded
+      let originalDeleted = false;
+      let deleteNote;
+      if (delete_original) {
+        if (anyFailed) {
+          deleteNote = 'Original preserved — one or more pages failed to refile.';
+        } else {
+          try {
+            await nextcloudDelete(source_path);
+            originalDeleted = true;
+          } catch (delErr) {
+            deleteNote = `Original deletion failed: ${delErr.message}`;
+          }
+        }
+      }
+
+      await sendProgress(pageCount, pageCount, 'Done');
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            pages_processed: pageCount,
+            pages_succeeded: results.filter(r => r.success).length,
+            original_deleted: originalDeleted,
+            ...(deleteNote ? { delete_note: deleteNote } : {}),
+            results,
+          }),
+        }],
+      };
+
+    } finally {
+      for (const f of allTempFiles) {
+        try { execSync(`rm -f ${JSON.stringify(f)}`); } catch (_) {}
+      }
+    }
   }
 
   if (name === "ocr_inbound_media") {
