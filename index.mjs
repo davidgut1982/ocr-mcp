@@ -117,28 +117,44 @@ async function callPolycr(filePath) {
   }
 }
 
-// Why: Selects the best engine result from polycr's multi-engine response to maximize text quality.
-// What: Iterates engines, scores by word count (primary) + confidence (tiebreak), returns best.
-// Test: Pass a data object with two engines where one has more words; assert the higher-word engine is returned.
+// Why: Selects the best engine result using confidence-weighted scoring and first-line consensus.
+// What: Drops results with confidence < 15 (unless only option). Scores by (word_count * 10 + confidence).
+//       If 2+ engines agree on the first non-empty line, boosts those engines by 500 points so
+//       consensus text wins over a high-word-count outlier.
+// Test: Pass results where two engines agree first line "DECRAENES SERVICE CENTER" and third has more
+//       words but disagrees — assert the consensus engine wins.
 function pickBestPolycr(data) {
-  // polycr returns { results: [{engine, text, confidence, error}] }
-  const results = data.results || [];
+  const results = (data.results || []).filter(r => r && typeof r.text === 'string' && !r.error);
+  if (results.length === 0) return null;
+
+  // Normalize first non-empty line for consensus comparison
+  function firstLine(text) {
+    return (text.split(/\r?\n/).map(l => l.trim()).find(l => l.length > 0) || '')
+      .toLowerCase().replace(/\s+/g, ' ');
+  }
+
+  // Drop very low confidence results unless they're the only ones
+  const confident = results.filter(r => (typeof r.confidence === 'number' ? r.confidence : 0) >= 15);
+  const pool = confident.length > 0 ? confident : results;
+
+  // Count first-line agreement
+  const firstLines = pool.map(r => firstLine(r.text));
+  const lineCounts = {};
+  for (const l of firstLines) lineCounts[l] = (lineCounts[l] || 0) + 1;
+  const consensusLine = Object.entries(lineCounts).sort((a, b) => b[1] - a[1])[0];
+  const hasConsensus = consensusLine && consensusLine[1] >= 2;
+
   let best = null;
   let bestScore = -1;
-  for (const result of results) {
-    if (!result || typeof result.text !== "string" || result.error) continue;
+  for (const result of pool) {
     const wc = countWords(result.text);
-    // polycr confidence is 0–100 integer percent; normalize to 0–1
-    const rawConf = typeof result.confidence === "number" ? result.confidence : 0;
-    const conf = rawConf / 100;
-    const score = wc * 1000 + conf;
+    const conf = typeof result.confidence === 'number' ? result.confidence : 0;
+    let score = wc * 10 + conf;
+    // Boost engines whose first line matches the consensus
+    if (hasConsensus && firstLine(result.text) === consensusLine[0]) score += 500;
     if (score > bestScore) {
       bestScore = score;
-      best = {
-        engine_used: result.engine,
-        text: result.text,
-        confidence: conf,
-      };
+      best = { engine_used: result.engine, text: result.text, confidence: conf / 100 };
     }
   }
   return best;
