@@ -1541,8 +1541,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             );
           } catch (scanErr) {
             const isFeederEmpty =
-              (scanErr.stderr && (scanErr.stderr.includes('No documents') || scanErr.stderr.includes('Document feeder empty'))) ||
-              (scanErr.message && (scanErr.message.includes('No documents') || scanErr.message.includes('Document feeder empty'))) ||
+              (scanErr.stderr && (
+                scanErr.stderr.includes('No documents') ||
+                scanErr.stderr.includes('Document feeder empty') ||
+                scanErr.stderr.includes('Document feeder out of documents')
+              )) ||
+              (scanErr.message && (
+                scanErr.message.includes('No documents') ||
+                scanErr.message.includes('Document feeder empty') ||
+                scanErr.message.includes('Document feeder out of documents')
+              )) ||
               scanErr.status === 7;
 
             const isTimeout = scanErr.message && scanErr.message.includes('timed out');
