@@ -485,6 +485,11 @@ function generateFilename(text, classification, description, ext) {
     slug = classification.type;
   }
   slug = slug.trim()
+    // Normalize OCR camelCase concatenation artifacts before splitting.
+    // Pattern: two uppercase letters followed by a lowercase letter (e.g. "CCenter",
+    // "SService") means a stray capital was merged with the next word. Insert a space
+    // so "CCenter" → "C Center" and the single-char "C" gets filtered below.
+    .replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')
     .split(/[\s\-_]+/)
     .map(w => {
       // Strip leading/trailing non-alphanumeric chars before title-casing so that
