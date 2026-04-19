@@ -362,10 +362,15 @@ function generateFilename(text, classification, description, ext) {
 
   let slug;
   const ocrTitle = extractTitleSlug(text);
-  if (ocrTitle) {
+  // If the OCR title is too short after slug-cleaning (token fallback produced < 5 chars),
+  // prefer the caller-supplied description which is usually more informative.
+  const ocrTitleCleaned = ocrTitle.replace(/[^a-zA-Z0-9]/g, '');
+  if (ocrTitle && ocrTitleCleaned.length >= 5) {
     slug = ocrTitle;
   } else if (description) {
     slug = description;
+  } else if (ocrTitle) {
+    slug = ocrTitle;
   } else {
     slug = classification.type;
   }
@@ -416,6 +421,13 @@ function extractTitleSlug(text) {
     const tokens = line.split(/\s+/).filter(t => t.length > 0);
     const digitTokens = tokens.filter(t => /\d/.test(t)).length;
     if (tokens.length > 0 && digitTokens / tokens.length > 0.4) return true;
+    // Reject street address lines (e.g. "S Eastwood Drive", "1421 W Lake Shore Blvd")
+    const roadTypes = /\b(street|st|avenue|ave|boulevard|blvd|drive|dr|road|rd|lane|ln|way|court|ct|place|pl|parkway|pkwy|circle|cir|trail|trl)\b/i;
+    const addressPrefixes = /^(north|south|east|west|n|s|e|w)\b/i;
+    if (roadTypes.test(line) && (addressPrefixes.test(line) || /^\d/.test(line))) return true;
+    // Reject common form-field label phrases
+    const formLabels = /^(work\s+authorized|authorized\s+by|customer\s+signature|date\s+of\s+service|service\s+advisor|vehicle\s+in|vehicle\s+out|mileage\s+in|mileage\s+out|license\s+plate|vin\s+number|technician|print\s+name|signature)\b/i;
+    if (formLabels.test(line)) return true;
     return false;
   }
 
