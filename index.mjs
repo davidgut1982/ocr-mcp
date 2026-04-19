@@ -1681,58 +1681,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         //       separate_pages=false assert result.pages===2 and result.success===true;
         //       with separate_pages=true assert results.length===2.
 
-        // Step 1: Collect all page JPEGs from ADF
-        const pageJpegs = [];
-        let pageNum = 0;
+        // Step 1: Collect all page JPEGs from ADF using --batch mode.
+        //
+        // Why --batch instead of a per-call loop:
+        //   With eSCL/AirScan scanners (Canon MF741C via airscan backend), each new
+        //   `scanimage` invocation opens a fresh eSCL scan job. The Canon feeds ALL
+        //   remaining ADF pages for that job, but since JPEG is single-frame, only
+        //   page 1 is written. By the time the loop tries page 2 the feeder is empty.
+        //   `--batch` keeps one SANE session open and calls sane_start() per page
+        //   internally, so each page is fetched correctly before the next ejects.
+        //
+        // What: Runs a single scanimage --batch command that writes numbered JPEGs
+        //   (/tmp/scan_TIMESTAMP_p1.jpg, _p2.jpg, …). After the command finishes
+        //   (exit 0 or feeder-empty non-zero), we discover the written files in order.
 
-        // Emit an initial progress notification to reset the client timeout during
-        // Canon warmup (the scanner takes several seconds before the first page feeds).
-        await sendProgress(0, -1, 'ADF scan starting — warming up scanner');
+        // Pre-scan progress notification resets the MCP client timeout so Canon
+        // warmup time (several seconds before the first page feeds) doesn't kill us.
+        await sendProgress(0, -1, 'ADF batch scan starting — warming up scanner');
 
-        while (true) {
-          pageNum += 1;
-          const tmpJpeg = `/tmp/scan_${timestamp}_p${pageNum}.jpg`;
-          allTempFiles.push(tmpJpeg);
+        const batchPattern = `/tmp/scan_${timestamp}_p%d.jpg`;
 
-          try {
-            execSync(
-              `scanimage --device-name=${JSON.stringify(deviceName)} --format=jpeg --output-file=${JSON.stringify(tmpJpeg)} --resolution=300 --mode=${JSON.stringify(scanMode)} --source=${JSON.stringify(params.source)}`,
-              { timeout: 120000 }
-            );
-          } catch (scanErr) {
-            const isFeederEmpty =
-              (scanErr.stderr && (
-                scanErr.stderr.includes('No documents') ||
-                scanErr.stderr.includes('Document feeder empty') ||
-                scanErr.stderr.includes('Document feeder out of documents')
-              )) ||
-              (scanErr.message && (
-                scanErr.message.includes('No documents') ||
-                scanErr.message.includes('Document feeder empty') ||
-                scanErr.message.includes('Document feeder out of documents')
-              )) ||
-              scanErr.status === 7;
-
-            const isTimeout = scanErr.message && scanErr.message.includes('timed out');
-
-            if (isFeederEmpty) {
-              break;
-            } else if (isTimeout && pageJpegs.length > 0) {
-              break; // scanner timed out mid-batch but we have pages — treat as feeder done
-            } else if (isTimeout && pageJpegs.length === 0) {
+        try {
+          execSync(
+            `scanimage --device-name=${JSON.stringify(deviceName)} --batch=${JSON.stringify(batchPattern)} --batch-start=1 --batch-count=99 --format=jpeg --resolution=300 --mode=${JSON.stringify(scanMode)} --source=${JSON.stringify(params.source)}`,
+            { timeout: 300000 }
+          );
+        } catch (batchErr) {
+          // scanimage --batch exits non-zero when the ADF is exhausted — that is
+          // expected and not an error as long as at least one file was written.
+          // A real error (no files written, timeout before first page) is handled below.
+          const isTimeout = batchErr.message && batchErr.message.includes('timed out');
+          if (isTimeout) {
+            // Check whether we got any files before the timeout
+            const firstPage = `/tmp/scan_${timestamp}_p1.jpg`;
+            if (!fs.existsSync(firstPage) || fs.statSync(firstPage).size === 0) {
               throw new Error('Scanner timed out before any pages were captured. Check that the Canon is awake and the ADF is loaded.');
-            } else {
-              throw scanErr;
             }
+            // Otherwise fall through and use whatever pages were captured
           }
+          // All other exits (including feeder-empty exit codes) are treated as
+          // normal end-of-batch — discover the files written below.
+        }
 
-          const stat = fs.statSync(tmpJpeg);
-          if (stat.size === 0) {
-            throw new Error(`scanimage produced a zero-byte file for page ${pageJpegs.length + 1}. Possible eSCL/AirScan firmware issue or feeder jam.`);
-          }
-          pageJpegs.push(tmpJpeg);
-          // Reset the client 60s timeout window after each successfully scanned page.
-          await sendProgress(pageJpegs.length, -1, `Page ${pageJpegs.length} scanned`);
+        // Discover pages: walk p1, p2, … until a file is missing or empty.
+        const pageJpegs = [];
+        for (let n = 1; n <= 99; n++) {
+          const f = `/tmp/scan_${timestamp}_p${n}.jpg`;
+          if (!fs.existsSync(f)) break;
+          const stat = fs.statSync(f);
+          if (stat.size === 0) break; // zero-byte means scanner stopped here
+          pageJpegs.push(f);
+          allTempFiles.push(f);
         }
 
         if (pageJpegs.length === 0) {
@@ -1741,6 +1740,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             isError: true,
           };
         }
+
+        await sendProgress(pageJpegs.length, pageJpegs.length, `${pageJpegs.length} page(s) scanned`);
 
         if (separate_pages) {
           // Opt-in: original per-page pipeline — process each JPEG independently
