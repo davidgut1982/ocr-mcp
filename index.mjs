@@ -486,23 +486,22 @@ function classifyDocumentForFiling(text, profile, description) {
 async function generateFilenamePartsWithLLM(ocrText, classification) {
   try {
     const today = new Date().toISOString().split('T')[0];
-    const snippet = ocrText.slice(0, 600);
+    const snippet = ocrText.slice(0, 1200);
     const prompt =
       `You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.\n\n` +
       `Return EXACTLY two lines:\n` +
-      `Line 1: The document date in ISO format YYYY-MM-DD. If no date is found, return ${today} in ISO format.\n` +
+      `Line 1: The document date in ISO format YYYY-MM-DD. Search carefully for any date in the text (invoice date, service date, date of service, statement date, etc.). If you cannot find any date, return the word UNKNOWN.\n` +
       `Line 2: A filename slug: 2-4 words, underscores between words, TitleCase each word.\n\n` +
       `Rules for the slug:\n` +
       `- MUST start with the business or vendor name found in the OCR text (who sent, issued, or performed the service)\n` +
       `- Do NOT use vehicle make/model (Subaru, Toyota, etc.) — those are the filing destination, not the vendor\n` +
       `- Remove apostrophes entirely (O'Connor → OConnor)\n` +
       `- The classification path "${classification.path}" is a routing hint only, not the source of the filename\n\n` +
-      `Today's date is ${today}.\n\n` +
       `Example output:\n` +
       `2025-11-07\n` +
       `DeCraenes_Service_Center_Invoice\n\n` +
-      `Example output:\n` +
-      `2024-03-15\n` +
+      `Example output (no date found):\n` +
+      `UNKNOWN\n` +
       `OConnor_Electric_Invoice\n\n` +
       `OCR text: ${snippet}`;
 
@@ -541,8 +540,10 @@ async function generateFilenamePartsWithLLM(ocrText, classification) {
     const dateLine = lines[0];
     const slugLine = lines[1];
 
-    // Validate ISO date format; fall back to today if malformed.
-    const date = /^\d{4}-\d{2}-\d{2}$/.test(dateLine) ? dateLine : today;
+    // If date line is UNKNOWN, return null date so caller falls through to regex chain.
+    // If date line is a valid ISO date, use it. Otherwise treat as unknown.
+    const dateValid = /^\d{4}-\d{2}-\d{2}$/.test(dateLine);
+    const date = dateValid ? dateLine : null;
 
     const slug = slugLine
       .replace(/['\u2018\u2019\u02BC]/g, '')
@@ -551,7 +552,9 @@ async function generateFilenamePartsWithLLM(ocrText, classification) {
       .replace(/^_|_$/g, '')
       .slice(0, 60);
 
-    return (slug.length >= 3) ? { date, slug } : null;
+    if (slug.length < 3) return null;
+    // Return slug always; date may be null (caller will run regex fallback for date).
+    return { date, slug };
   } catch (_) {
     return null;
   }
@@ -565,12 +568,14 @@ async function generateFilenamePartsWithLLM(ocrText, classification) {
 //       assert result starts with "2026-06-01_".
 async function generateFilename(text, classification, description, ext) {
   // Try LLM-based date+slug extraction first (one call for both fields).
+  // llmParts.date may be null if LLM returned UNKNOWN — in that case fall through
+  // to regex date extraction below but still use the LLM slug.
   const llmParts = await generateFilenamePartsWithLLM(text, classification);
-  if (llmParts) {
+  if (llmParts?.date) {
     return `${llmParts.date}_${llmParts.slug}.${ext}`;
   }
 
-  // Fallback: regex date extraction + heuristic slug generation.
+  // Regex date extraction — runs when LLM is unavailable or returned UNKNOWN date.
   const months = {
     january:'01', february:'02', march:'03',    april:'04',
     may:'05',     june:'06',     july:'07',      august:'08',
@@ -640,6 +645,11 @@ async function generateFilename(text, classification, description, ext) {
   }
   // fallback: today
   if (!dateStr) dateStr = new Date().toISOString().split('T')[0];
+
+  // If LLM gave us a slug (even though its date was UNKNOWN), use it.
+  if (llmParts?.slug) {
+    return `${dateStr}_${llmParts.slug}.${ext}`;
+  }
 
   let slug;
   {
