@@ -2174,10 +2174,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             }
           }
 
-          // Step D: Classify and generate filename
+          // Step D: Classify and generate filename.
+          // description is passed to classifyDocumentForFiling as a routing hint, but NOT
+          // to generateFilename — each page names itself from its own text. Passing the
+          // batch description to generateFilename causes pages with sparse text to inherit
+          // the description slug (e.g. page 4 with no DeCraenes text gets named "Decraenes").
           await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — classifying`);
           const classification = classifyDocumentForFiling(ocrText, 'doc-bw', description);
-          let filename = generateFilename(ocrText, classification, description, 'pdf');
+          let filename = generateFilename(ocrText, classification, '', 'pdf');
 
           // Collision safety across pages
           let attempt = 0;
