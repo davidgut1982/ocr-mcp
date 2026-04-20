@@ -468,14 +468,68 @@ function classifyDocumentForFiling(text, profile, description) {
   return { type: 'document', path: '/Inbox/' };
 }
 
+// Why: Produces a human-readable filename slug via LLM so filenames reflect meaningful
+//      document content (e.g. "Rocket_Mortgage_Statement") rather than OCR noise.
+// What: POSTs the first 600 chars of OCR text plus classification hints to the LiteLLM
+//       proxy and returns a sanitized 2-4 word underscore-separated TitleCase slug, or
+//       null on any failure (timeout, HTTP error, empty/garbage response).
+// Test: Mock fetch to return '{"choices":[{"message":{"content":"Verizon_Wireless_Bill"}}]}';
+//       assert return value is "Verizon_Wireless_Bill".
+//       Mock fetch to throw; assert return value is null.
+async function generateSlugWithLLM(ocrText, classification) {
+  try {
+    const snippet = ocrText.slice(0, 600);
+    const prompt =
+      `Generate a concise filename slug for this document (2-4 words, underscores between words, title case). ` +
+      `Classification: ${classification.type} filed to ${classification.path}. ` +
+      `OCR text: ${snippet}. ` +
+      `Return ONLY the slug, nothing else. ` +
+      `Example outputs: DeCraenes_Service_Center_Invoice, OConnor_Electric_Invoice, Rocket_Mortgage_Statement, Verizon_Wireless_Bill`;
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 15000);
+    let resp;
+    try {
+      resp = await fetch(LITELLM_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${LITELLM_KEY}`,
+        },
+        body: JSON.stringify({
+          model: LITELLM_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 32,
+          temperature: 0,
+        }),
+        signal: ac.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const raw = data?.choices?.[0]?.message?.content;
+    if (!raw || typeof raw !== 'string') return null;
+    const slug = raw.trim()
+      .replace(/[^a-zA-Z0-9_]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_|_$/g, '')
+      .slice(0, 60);
+    return slug.length >= 3 ? slug : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // Why: Produces consistent, date-prefixed filenames from OCR text so documents are
 //      sortable by date without manual renaming.
-// What: Extracts first recognizable date from text (ISO, US, or long-form month);
-//       falls back to today. Appends a sanitized slug derived from a title-like line
-//       near the top of the document, or from description/classification as fallback.
+// What: Tries LLM-based slug generation first; falls back to extractTitleSlug heuristics
+//       on any failure. Extracts first recognizable date from text (ISO, US, or long-form
+//       month); falls back to today.
 // Test: Call with text="SUMMER ENRICHMENT PROGRAM\nJune 1, 2026" ext="pdf";
-//       assert result starts with "2026-06-01_summer-enrichment-program".
-function generateFilename(text, classification, description, ext) {
+//       assert result starts with "2026-06-01_".
+async function generateFilename(text, classification, description, ext) {
   const months = {
     january:'01', february:'02', march:'03',    april:'04',
     may:'05',     june:'06',     july:'07',      august:'08',
@@ -492,19 +546,25 @@ function generateFilename(text, classification, description, ext) {
   else if (m3) dateStr = `${m3[3]}-${months[m3[1].toLowerCase()]}-${m3[2].padStart(2,'0')}`;
   else         dateStr = new Date().toISOString().split('T')[0];
 
+  // Try LLM-based slug first; fall back to heuristics on failure.
+  const llmSlug = await generateSlugWithLLM(text, classification);
   let slug;
-  const ocrTitle = extractTitleSlug(text);
-  // If the OCR title is too short after slug-cleaning (token fallback produced < 5 chars),
-  // prefer the caller-supplied description which is usually more informative.
-  const ocrTitleCleaned = ocrTitle.replace(/[^a-zA-Z0-9]/g, '');
-  if (ocrTitle && ocrTitleCleaned.length >= 5) {
-    slug = ocrTitle;
-  } else if (description) {
-    slug = description;
-  } else if (ocrTitle) {
-    slug = ocrTitle;
+  if (llmSlug) {
+    return `${dateStr}_${llmSlug}.${ext}`;
   } else {
-    slug = classification.type;
+    const ocrTitle = extractTitleSlug(text);
+    // If the OCR title is too short after slug-cleaning (token fallback produced < 5 chars),
+    // prefer the caller-supplied description which is usually more informative.
+    const ocrTitleCleaned = ocrTitle.replace(/[^a-zA-Z0-9]/g, '');
+    if (ocrTitle && ocrTitleCleaned.length >= 5) {
+      slug = ocrTitle;
+    } else if (description) {
+      slug = description;
+    } else if (ocrTitle) {
+      slug = ocrTitle;
+    } else {
+      slug = classification.type;
+    }
   }
   slug = slug.trim()
     // Normalize OCR camelCase concatenation artifacts before splitting.
@@ -1766,7 +1826,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       // Step 3: Classify + generate filename (deduplicate same-second collisions)
       const classification = classifyDocumentForFiling(ocrText, profile, description);
       const ext = profile === 'photo' ? 'jpg' : 'pdf';
-      let baseFilename = filenameOverride || generateFilename(ocrText, classification, description || '', ext);
+      let baseFilename = filenameOverride || await generateFilename(ocrText, classification, description || '', ext);
       if (usedFilenames.has(baseFilename)) {
         // Append _p2, _p3 … before the extension to avoid collisions
         const dotIdx = baseFilename.lastIndexOf('.');
@@ -1916,7 +1976,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         // Step 3: Classify + generate filename from page 1 OCR
         const classification = classifyDocumentForFiling(ocrText, profile, description);
         const ext = profile === 'photo' ? 'jpg' : 'pdf';
-        const filename = filenameOverride || generateFilename(ocrText, classification, description || '', ext);
+        const filename = filenameOverride || await generateFilename(ocrText, classification, description || '', ext);
         const ncPath = ncPathOverride || classification.path;
 
         // Step 4: Merge all page JPEGs into one PDF via ImageMagick, then run ocrmypdf
@@ -2189,7 +2249,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           // the description slug (e.g. page 4 with no DeCraenes text gets named "Decraenes").
           await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — classifying`);
           const classification = classifyDocumentForFiling(ocrText, 'doc-bw', description);
-          let filename = generateFilename(ocrText, classification, '', 'pdf');
+          let filename = await generateFilename(ocrText, classification, '', 'pdf');
 
           // Collision safety across pages
           let attempt = 0;
@@ -2319,7 +2379,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
       const pdfResult = await createSearchablePdfFromJpeg(targetFile, tmpPdf);
       const classification = classifyDocumentForFiling(ocrResult.text || '', 'doc-bw', description);
-      const filename = generateFilename(ocrResult.text || '', classification, description || '', 'pdf');
+      const filename = await generateFilename(ocrResult.text || '', classification, description || '', 'pdf');
       const ncPath = classification.path || '/Inbox/';
       await nextcloudUpload(tmpPdf, ncPath, filename);
       return {
