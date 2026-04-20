@@ -2177,8 +2177,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           }
           usedFilenames.add(filename);
 
-          // Create searchable PDF (pass split PDF directly — polycr + ocrmypdf handle PDF input)
-          const pdfResult = await createSearchablePdfFromJpeg(splitPdf, ocrPdf);
+          // Create searchable PDF from the JPEG (not the split PDF — the gs-split PDF already
+          // has a text layer from the original scan, which causes ocrmypdf to abort with
+          // PriorOcrFoundError. The JPEG has no text layer so OCR proceeds cleanly.)
+          const pdfResult = await createSearchablePdfFromJpeg(splitJpeg, ocrPdf);
 
           // Upload
           const ncPath = classification.path || '/Inbox/';
