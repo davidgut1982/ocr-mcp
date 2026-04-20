@@ -541,10 +541,33 @@ async function generateFilename(text, classification, description, ext) {
   const m2 = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
   const m3 = text.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})\b/i);
 
-  if (m1)      dateStr = `${m1[1]}-${m1[2].padStart(2,'0')}-${m1[3].padStart(2,'0')}`;
-  else if (m2) dateStr = `${m2[3]}-${m2[1].padStart(2,'0')}-${m2[2].padStart(2,'0')}`;
-  else if (m3) dateStr = `${m3[3]}-${months[m3[1].toLowerCase()]}-${m3[2].padStart(2,'0')}`;
-  else         dateStr = new Date().toISOString().split('T')[0];
+  // m1: ISO-style YYYY-MM-DD — validate year, month, day ranges
+  if (m1) {
+    const yr = parseInt(m1[1], 10);
+    const mo = parseInt(m1[2], 10);
+    const dy = parseInt(m1[3], 10);
+    if (yr >= 1900 && yr <= 2099 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+      dateStr = `${m1[1]}-${m1[2].padStart(2, '0')}-${m1[3].padStart(2, '0')}`;
+    }
+  }
+  // m2: US-style MM/DD/YYYY — validate month, day, year ranges
+  if (!dateStr && m2) {
+    const mo = parseInt(m2[1], 10);
+    const dy = parseInt(m2[2], 10);
+    const yr = parseInt(m2[3], 10);
+    if (yr >= 1900 && yr <= 2099 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+      dateStr = `${m2[3]}-${m2[1].padStart(2, '0')}-${m2[2].padStart(2, '0')}`;
+    }
+  }
+  // m3: long-form "Month D, YYYY"
+  if (!dateStr && m3) {
+    const yr = parseInt(m3[3], 10);
+    if (yr >= 1900 && yr <= 2099) {
+      dateStr = `${m3[3]}-${months[m3[1].toLowerCase()]}-${m3[2].padStart(2, '0')}`;
+    }
+  }
+  // fallback: today
+  if (!dateStr) dateStr = new Date().toISOString().split('T')[0];
 
   // Try LLM-based slug first; fall back to heuristics on failure.
   const llmSlug = await generateSlugWithLLM(text, classification);
