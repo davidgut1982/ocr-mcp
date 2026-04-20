@@ -73,9 +73,9 @@ Documents are auto-classified from OCR text and routed to Nextcloud folders. Cla
 {
   "properties": [
     {
-      "address": "3320 chukar mortgage",
-      "path": "/Personal/Housing/3320-Chukar/Mortage/",
-      "keywords": ["rocket mortgage", "loan number 3544452112"]
+      "address": "123 sample dr mortgage",
+      "path": "/Personal/Housing/123-Sample-Dr/Mortage/",
+      "keywords": ["rocket mortgage", "loan number XXXXXXXXXX"]
     }
   ],
   "custom_rules": [
@@ -138,7 +138,7 @@ Register in OpenClaw `~/.openclaw/openclaw.json`:
     "servers": {
       "ocr": {
         "command": "node",
-        "args": ["/home/david/ocr-mcp/index.mjs"],
+        "args": ["/home/your-username/ocr-mcp/index.mjs"],
         "requestTimeoutMs": 180000,
         "env": {
           "NEXTCLOUD_URL": "...",

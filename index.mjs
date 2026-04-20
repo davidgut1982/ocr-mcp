@@ -41,7 +41,7 @@ const SCANNERS = {
 const DEFAULT_SCANNER = SCANNERS['canon-mf741c'];
 
 const NEXTCLOUD_URL = process.env.NEXTCLOUD_URL || 'https://nextcloud.shifting-ground.link';
-const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER || 'david.gutowsky';
+const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER || 'your-nextcloud-user';
 const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD || '';
 const NEXTCLOUD_WEBDAV_BASE = `${NEXTCLOUD_URL}/remote.php/dav/files/${NEXTCLOUD_USER}`;
 
@@ -406,14 +406,14 @@ function classifyDocumentForFiling(text, profile, description) {
 
   // Check custom rules BEFORE property rules.
   // Why: Many documents are mailed to the customer's home address, so a property
-  //      address match (e.g. "3320 Chukar") would fire on an auto repair invoice
+  //      address match (e.g. "123 Sample Dr") would fire on an auto repair invoice
   //      addressed to David before the "subaru" vehicle rule ever runs. Custom rules
   //      represent what the document IS about; property rules represent where the
   //      customer lives — the former should win.
   // What: Iterates custom_rules; first keyword match returns immediately with rule.path
   //       (after substituting the most recent 4-digit year if detect_year is set).
   // Test: Add a rule with keywords:["subaru"] path:"/Auto/"; pass text containing both
-  //       "subaru" and "3320 chukar"; assert type==="auto" and path==="/Auto/".
+  //       "subaru" and "123 sample dr"; assert type==="auto" and path==="/Auto/".
   for (const rule of (routingRules.custom_rules || [])) {
     const keywords = rule.keywords || [];
     if (keywords.some(kw => lower.includes(kw.toLowerCase()))) {
@@ -433,7 +433,7 @@ function classifyDocumentForFiling(text, profile, description) {
   }
 
   // Check property-based routing after custom rules.
-  // Why: Property address keywords (e.g. "3320 chukar") appear on many documents simply
+  // Why: Property address keywords (e.g. "123 sample dr") appear on many documents simply
   //      because they are the customer's mailing address — they should only route to a
   //      property folder when no more-specific document-type rule matched first.
   for (const prop of (routingRules.properties || [])) {
@@ -1284,17 +1284,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "nextcloud_move",
-      description: "Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning. source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/3320-Chukar/Mortage/old.pdf). Returns success and the new full URL.",
+      description: "Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning. source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/123-Sample-Dr/Mortage/old.pdf). Returns success and the new full URL.",
       inputSchema: {
         type: "object",
         properties: {
           source_path: {
             type: "string",
-            description: "Current full path in Nextcloud (e.g. /Personal/Housing/3320-Chukar/Mortage/2025-11-15_bad-name.pdf)",
+            description: "Current full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_bad-name.pdf)",
           },
           dest_path: {
             type: "string",
-            description: "New full path in Nextcloud (e.g. /Personal/Housing/3320-Chukar/Mortage/2025-11-15_rocket-mortgage.pdf). Must be in the same folder for a rename.",
+            description: "New full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_rocket-mortgage.pdf). Must be in the same folder for a rename.",
           },
         },
         required: ["source_path", "dest_path"],

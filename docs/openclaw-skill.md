@@ -146,9 +146,9 @@ Pages with fewer than 10 words trigger an automatic image enhancement retry. If 
 The MCP reads OCR text and routes to the correct Nextcloud folder automatically. **Custom rules are checked first, then property rules. This prevents a home address appearing on a bill from routing to a housing folder when a more-specific document-type rule (e.g. Subaru) should win.**
 
 **Properties (checked after custom rules):**
-- "rocket mortgage" or "loan number 3544452112" → `/Personal/Housing/3320-Chukar/Mortgage/`
-- "3320 chukar" or "woodstock, il 60098" → `/Personal/Housing/3320-Chukar/`
-- "10810 pheasant" → `/Personal/Housing/10810-Pheasant/` Also matches the bare word "pheasant" alone.
+- "rocket mortgage" or "loan number XXXXXXXXXX" → `/Personal/Housing/123-Sample-Dr/Mortgage/`
+- "123 sample dr" or "anytown, il 00000" → `/Personal/Housing/123-Sample-Dr/`
+- "456 other rd" → `/Personal/Housing/456-Other-Rd/` Also matches the bare word "other" alone.
 
 **All other rules:**
 - W-2, 1099, 1040, IRS, adjusted gross income, federal income tax → `/Personal/Financial/Taxes/{year}/`
