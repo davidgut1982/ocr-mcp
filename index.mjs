@@ -481,7 +481,13 @@ async function generateSlugWithLLM(ocrText, classification) {
     const snippet = ocrText.slice(0, 600);
     const prompt =
       `Generate a concise filename slug for this document (2-4 words, underscores between words, title case). ` +
-      `Classification: ${classification.type} filed to ${classification.path}. ` +
+      `The slug MUST start with the business or vendor name found in the OCR text — ` +
+      `that is, the company or person who sent, issued, or performed the service described in the document ` +
+      `(e.g. "DeCraenes", "OConnor Electric", "Verizon", "Rocket Mortgage"). ` +
+      `Do NOT use the vehicle make or model (e.g. Subaru, Toyota, Honda) as the filename — ` +
+      `those appear in the classification path only as a filing destination, not as the vendor. ` +
+      `Remove apostrophes entirely (O'Connor → OConnor, not O_Connor). ` +
+      `The classification path "${classification.path}" is only a routing hint, NOT the source of the filename. ` +
       `OCR text: ${snippet}. ` +
       `Return ONLY the slug, nothing else. ` +
       `Example outputs: DeCraenes_Service_Center_Invoice, OConnor_Electric_Invoice, Rocket_Mortgage_Statement, Verizon_Wireless_Bill`;
@@ -498,7 +504,10 @@ async function generateSlugWithLLM(ocrText, classification) {
         },
         body: JSON.stringify({
           model: LITELLM_MODEL,
-          messages: [{ role: 'user', content: prompt }],
+          messages: [
+            { role: 'system', content: 'You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.' },
+            { role: 'user', content: prompt },
+          ],
           max_tokens: 32,
           temperature: 0,
         }),
@@ -512,6 +521,7 @@ async function generateSlugWithLLM(ocrText, classification) {
     const raw = data?.choices?.[0]?.message?.content;
     if (!raw || typeof raw !== 'string') return null;
     const slug = raw.trim()
+      .replace(/['\u2018\u2019\u02BC]/g, '')
       .replace(/[^a-zA-Z0-9_]/g, '_')
       .replace(/_+/g, '_')
       .replace(/^_|_$/g, '')
@@ -534,12 +544,17 @@ async function generateFilename(text, classification, description, ext) {
     january:'01', february:'02', march:'03',    april:'04',
     may:'05',     june:'06',     july:'07',      august:'08',
     september:'09', october:'10', november:'11', december:'12',
+    jan:'01', feb:'02', mar:'03', apr:'04',
+    jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12',
   };
 
   let dateStr = null;
-  const m1 = text.match(/\b(\d{4})[\/\-](\d{2})[\/\-](\d{2})\b/);
-  const m2 = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
-  const m3 = text.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})\b/i);
+  const m1  = text.match(/\b(\d{4})[\/\-](\d{2})[\/\-](\d{2})\b/);
+  const m2  = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
+  const m3  = text.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})\b/i);
+  const m3b = text.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{1,2}),?\s+(\d{4})\b/i);
+  const m3c = text.match(/\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{4})\b/i);
+  const m2b = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})\b/);
 
   // m1: ISO-style YYYY-MM-DD — validate year, month, day ranges
   if (m1) {
@@ -564,6 +579,32 @@ async function generateFilename(text, classification, description, ext) {
     const yr = parseInt(m3[3], 10);
     if (yr >= 1900 && yr <= 2099) {
       dateStr = `${m3[3]}-${months[m3[1].toLowerCase()]}-${m3[2].padStart(2, '0')}`;
+    }
+  }
+  // m3b: abbreviated month "Nov 7, 2025" or "Nov. 7, 2025"
+  if (!dateStr && m3b) {
+    const yr = parseInt(m3b[3], 10);
+    const key = m3b[1].toLowerCase().replace('.', '');
+    if (yr >= 1900 && yr <= 2099 && months[key]) {
+      dateStr = `${m3b[3]}-${months[key]}-${m3b[2].padStart(2, '0')}`;
+    }
+  }
+  // m3c: day-first abbreviated "7 Nov 2025" or "15 Jan 2026"
+  if (!dateStr && m3c) {
+    const yr = parseInt(m3c[3], 10);
+    const key = m3c[2].toLowerCase().replace('.', '');
+    if (yr >= 1900 && yr <= 2099 && months[key]) {
+      dateStr = `${m3c[3]}-${months[key]}-${m3c[1].padStart(2, '0')}`;
+    }
+  }
+  // m2b: two-digit year US-style "11/07/25" or "1/15/26"
+  if (!dateStr && m2b) {
+    const mo = parseInt(m2b[1], 10);
+    const dy = parseInt(m2b[2], 10);
+    const rawYr = parseInt(m2b[3], 10);
+    const yr = rawYr <= 30 ? 2000 + rawYr : 1900 + rawYr;
+    if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+      dateStr = `${yr}-${m2b[1].padStart(2, '0')}-${m2b[2].padStart(2, '0')}`;
     }
   }
   // fallback: today
