@@ -2123,48 +2123,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       let anyFailed = false;
 
       for (let i = 1; i <= pageCount; i++) {
-        await sendProgress(i - 1, pageCount, `Processing page ${i} of ${pageCount}`);
-
         const splitPdf  = `/tmp/split_${timestamp}_p${i}.pdf`;
         const splitJpeg = `/tmp/split_${timestamp}_p${i}.jpg`;
-        const ocrPdf    = `/tmp/split_${timestamp}_p${i}_ocr.pdf`;
-        allTempFiles.push(splitPdf, splitJpeg, ocrPdf);
+        const textFile  = `/tmp/split_${timestamp}_p${i}_text.txt`;
+        allTempFiles.push(splitPdf, splitJpeg, textFile);
 
         try {
-          // Extract single page via Ghostscript
+          // Step A: Extract single page via Ghostscript
+          await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — splitting`);
           execSync(
             `gs -dBATCH -dNOPAUSE -q -sDEVICE=pdfwrite -dFirstPage=${i} -dLastPage=${i} -sOutputFile=${JSON.stringify(splitPdf)} ${JSON.stringify(sourcePdf)}`,
             { timeout: 60000 }
           );
 
-          // Convert to JPEG for OCR
-          execSync(
-            `convert -density 300 ${JSON.stringify(splitPdf)}[0] -quality 85 ${JSON.stringify(splitJpeg)}`,
-            { timeout: 30000 }
-          );
+          // Step B: Extract text from existing text layer (fast — no network, no OCR service).
+          // The source PDF was already OCR'd, so each split page carries a text layer.
+          // Using gs txtwrite device avoids re-running polycr/LLM (~150s saved per page).
+          await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — extracting text`);
+          let ocrText = '';
+          let wordCount = 0;
+          let confidence = 0;
+          let pdfMethod = 'existing-text-layer';
+          try {
+            execSync(
+              `gs -q -dBATCH -dNOPAUSE -sDEVICE=txtwrite -sOutputFile=${JSON.stringify(textFile)} ${JSON.stringify(splitPdf)}`,
+              { timeout: 30000 }
+            );
+            if (fs.existsSync(textFile)) {
+              ocrText = fs.readFileSync(textFile, 'utf8').trim();
+              wordCount = countWords(ocrText);
+              confidence = wordCount > 0 ? 0.9 : 0;
+            }
+          } catch (_) {}
 
-          // OCR
-          let ocrResult = await ocrWithFallback(splitJpeg);
-          let ocrText = ocrResult.text || '';
-          let wordCount = ocrResult.word_count || 0;
-          let confidence = ocrResult.confidence || 0;
-
-          // Low-confidence retry with image enhancement
+          // Step C: Fallback to full JPEG OCR if text layer is empty or sparse
+          // (handles image-only PDFs that were scanned without OCR originally)
           if (wordCount < 10) {
-            const enhanced = splitJpeg.replace('.jpg', '_enhanced.jpg');
-            allTempFiles.push(enhanced);
-            try {
-              execSync(`convert ${JSON.stringify(splitJpeg)} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
-              const enhResult = await ocrWithFallback(enhanced);
-              if ((enhResult.word_count || 0) > wordCount) {
-                ocrText = enhResult.text || '';
-                wordCount = enhResult.word_count || 0;
-                confidence = enhResult.confidence || 0;
-              }
-            } catch (_) {}
+            await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — OCR (no text layer)`);
+            allTempFiles.push(splitJpeg);
+            execSync(
+              `convert -density 300 ${JSON.stringify(splitPdf)}[0] -quality 85 ${JSON.stringify(splitJpeg)}`,
+              { timeout: 30000 }
+            );
+            const ocrResult = await ocrWithFallback(splitJpeg);
+            if ((ocrResult.word_count || 0) > wordCount) {
+              ocrText = ocrResult.text || '';
+              wordCount = ocrResult.word_count || 0;
+              confidence = ocrResult.confidence || 0;
+              pdfMethod = ocrResult.engine_used || 'ocr-fallback';
+            }
           }
 
-          // Classify and generate filename
+          // Step D: Classify and generate filename
+          await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — classifying`);
           const classification = classifyDocumentForFiling(ocrText, 'doc-bw', description);
           let filename = generateFilename(ocrText, classification, description, 'pdf');
 
@@ -2177,14 +2188,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           }
           usedFilenames.add(filename);
 
-          // Create searchable PDF from the JPEG (not the split PDF — the gs-split PDF already
-          // has a text layer from the original scan, which causes ocrmypdf to abort with
-          // PriorOcrFoundError. The JPEG has no text layer so OCR proceeds cleanly.)
-          const pdfResult = await createSearchablePdfFromJpeg(splitJpeg, ocrPdf);
-
-          // Upload
+          // Step E: Upload split PDF directly — it already has a text layer, no re-OCR needed
+          await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — uploading`);
           const ncPath = classification.path || '/Inbox/';
-          await nextcloudUpload(pdfResult.path, ncPath, filename);
+          await nextcloudUpload(splitPdf, ncPath, filename);
 
           const inboxFlag = ncPath === '/Inbox/' ? 'Could not classify — filed to /Inbox/' : undefined;
 
@@ -2194,7 +2201,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             filename,
             filed_at: `${ncPath}${filename}`,
             document_type: classification.type,
-            pdf_method: pdfResult.method,
+            pdf_method: pdfMethod,
             word_count: wordCount,
             confidence: Math.round(confidence * 100) / 100,
             ocr_preview: ocrText.slice(0, 200).trim() || null,
