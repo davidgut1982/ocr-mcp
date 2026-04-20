@@ -8,8 +8,23 @@ import { execSync } from "child_process";
 import { promisify } from "util";
 import { execFile } from "child_process";
 import path from "path";
-import fs from "fs";
+import fs, { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import os from "os";
+
+// Single-instance guard — kill any previous instance on startup
+{
+  const PID_FILE = '/tmp/ocr-mcp.pid';
+  try {
+    if (existsSync(PID_FILE)) {
+      const oldPid = parseInt(readFileSync(PID_FILE, 'utf8').trim(), 10);
+      if (oldPid && oldPid !== process.pid) {
+        try { process.kill(oldPid, 'SIGTERM'); } catch (_) {}
+      }
+    }
+    writeFileSync(PID_FILE, String(process.pid));
+  } catch (_) {}
+  process.on('exit', () => { try { unlinkSync(PID_FILE); } catch (_) {} });
+}
 
 const execFileAsync = promisify(execFile);
 
