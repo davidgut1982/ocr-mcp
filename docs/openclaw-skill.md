@@ -180,12 +180,14 @@ After the tool returns, report each page's `filed_at` and `filename`. Flag any p
 - `filename` — generated filename
 - `pages` — page count
 - One-line OCR preview
+- `date` — always report the document date in ISO format (`YYYY-MM-DD`). If the document has no date, use today's date.
 
 If filename looks wrong — check for these indicators:
 - Contains generic words: "scan", "retry", "paper", "document", "flatbed"
 - Looks like an address fragment: contains "Drive", "Street", "Ave", "Road", "Blvd", "Lane", "Court", or starts with a street number
 - Looks like a form label: "Phone_No", "Received_By", "Description_Of_Work", "Job_Location", single-word technical terms
 - Too short (1 word) or too generic (just a type like "Invoice", "Receipt", "Statement" with no vendor name)
+- Date portion is not ISO format (`YYYY-MM-DD`) or is clearly wrong (year outside 1990–2099)
 
 Then:
 1. Report the filed path and what the filename looks like
