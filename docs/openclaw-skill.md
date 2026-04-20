@@ -181,10 +181,17 @@ After the tool returns, report each page's `filed_at` and `filename`. Flag any p
 - `pages` — page count
 - One-line OCR preview
 
-If filename looks wrong (contains "scan", "retry", "paper", "document", "flatbed"):
+If filename looks wrong — check for these indicators:
+- Contains generic words: "scan", "retry", "paper", "document", "flatbed"
+- Looks like an address fragment: contains "Drive", "Street", "Ave", "Road", "Blvd", "Lane", "Court", or starts with a street number
+- Looks like a form label: "Phone_No", "Received_By", "Description_Of_Work", "Job_Location", single-word technical terms
+- Too short (1 word) or too generic (just a type like "Invoice", "Receipt", "Statement" with no vendor name)
+
+Then:
 1. Report the filed path and what the filename looks like
-2. Offer to rename using `ocr__nextcloud_move`
-3. If user agrees, call `ocr__nextcloud_move` with corrected filename
+2. Suggest a better name based on the OCR content (vendor name + document type)
+3. Offer to rename using `ocr__nextcloud_move`
+4. If user agrees, call `ocr__nextcloud_move` with the corrected filename
 
 ---
 
