@@ -40,6 +40,8 @@ triggers:
 > If you think a system service needs to be started or checked before scanning,
 > you are wrong. Call the tool. It handles everything.
 
+> Note: `docs/scanning-profiles.md` describes low-level individual tools (`ocr__scan_document`, `ocr__ocr_image_polycr`, etc.). When using `ocr__scan_and_file` or `ocr__quick_scan` the pipeline runs automatically — do not call intermediate tools manually.
+
 # Document Scanning & Filing
 
 ## Canon MF741C hardware note
@@ -68,6 +70,8 @@ ocr__scan_and_file(profile="<profile>", description="<optional hint>")
 ```
 When scanning multiple separate documents, add `separate_pages=true`.
 
+Pass `filename` to override the auto-generated name entirely (only when the user provides an explicit filename, e.g. `"2026-04-13_verizon-bill.pdf"`).
+
 ---
 
 ### Attached image in chat
@@ -80,8 +84,7 @@ When `[media attached: media://inbound/<id>]` appears in the message:
 **Do NOT use vision capabilities** to read attached images — always use `ocr__ocr_inbound_media` so it goes through the polycr OCR engine.
 
 ### Single document in ADF / unspecified scan request (default)
-- Call `ocr__quick_scan()` immediately — no parameters, no questions
-- Only pass `description` if the user explicitly names the document (e.g. "scan this Verizon bill")
+- Call `ocr__quick_scan()` immediately — no questions. Pass `description` only if the user explicitly names the document; otherwise omit it.
 - Do NOT invent descriptions
 - `quick_scan` treats the entire ADF contents as one multi-page document
 
@@ -91,6 +94,8 @@ When `[media attached: media://inbound/<id>]` appears in the message:
 - Each page gets its own PDF and is classified/filed independently
 - **Default assumption for ADF**: if you don't know whether it's one document or many, use `separate_pages: true` — a merged multi-page PDF can't be unsplit, but separate single-page PDFs can always be recombined
 
+Pages with fewer than 10 words trigger an automatic image enhancement retry. If the page still has sparse text it will land in `/Inbox/` — flag it to the user as usual.
+
 ### Flatbed single page
 - Call `ocr__scan_and_file` with `profile: "doc-bw"`
 - Default scanner: `canon-mf741c`
@@ -98,6 +103,10 @@ When `[media attached: media://inbound/<id>]` appears in the message:
 ### User specifies a destination folder
 - Pass `nextcloud_path` with the exact folder (include trailing slash)
 - Still use ADF + `ocr__quick_scan` or `ocr__scan_and_file` unless user says flatbed
+
+### User specifies an exact filename
+- Pass `filename` with the exact name including `.pdf` extension
+- Still use whichever profile and scanner are appropriate for the content
 
 ### HP scanner (user says "HP" or Canon unreachable)
 - Call `ocr__scan_and_file` with `scanner: "hp-officejet-5740"` and `profile: "doc-bw"`
@@ -134,16 +143,19 @@ When `[media attached: media://inbound/<id>]` appears in the message:
 
 ## Auto-classification routing
 
-The MCP reads OCR text and routes to the correct Nextcloud folder automatically. **Property rules are checked first, before all other rules.**
+The MCP reads OCR text and routes to the correct Nextcloud folder automatically. **Custom rules are checked first, then property rules. This prevents a home address appearing on a bill from routing to a housing folder when a more-specific document-type rule (e.g. Subaru) should win.**
 
-**Properties (checked first):**
+**Properties (checked after custom rules):**
 - "rocket mortgage" or "loan number 3544452112" → `/Personal/Housing/3320-Chukar/Mortgage/`
 - "3320 chukar" or "woodstock, il 60098" → `/Personal/Housing/3320-Chukar/`
-- "10810 pheasant" → `/Personal/Housing/10810-Pheasant/`
+- "10810 pheasant" → `/Personal/Housing/10810-Pheasant/` Also matches the bare word "pheasant" alone.
 
 **All other rules:**
 - W-2, 1099, 1040, IRS, adjusted gross income, federal income tax → `/Personal/Financial/Taxes/{year}/`
 - Subaru, Subaru Outback → `/Personal/Auto/Subaru Outback/`
+
+> The Subaru Outback rule also matches "decraenes", "decraene's", and "de craenes" (the service shop name). Documents from DeCraenes Service Center will file to /Personal/Auto/Subaru Outback/ automatically.
+
 - Toyota Tundra, Tundra → `/Personal/Auto/Toyota Tundra/`
 - Bankruptcy, chapter 7, chapter 13, trustee, Hibbs → `/Personal/Legal/Genna/`
 - Unemployment, IDES, Illinois Department of Employment → `/Personal/Job/Unemployment/`
@@ -168,9 +180,17 @@ When the user asks to split, separate, or break apart a PDF that's already in Ne
 3. Pass `delete_original: true` only if the user explicitly says to delete or remove the original.
 4. Pass `description` if the user names the document type (e.g. "DeCraenes invoice").
 
+If any page fails to refile, the original is preserved regardless of `delete_original`. Always check `pages_succeeded` vs `pages_processed` in the response.
+
 **Do NOT say things like "I don't have direct access" or "let me know if that works" — the tool handles the download, split, OCR, classify, and upload automatically.**
 
 After the tool returns, report each page's `filed_at` and `filename`. Flag any pages that landed in `/Inbox/`.
+
+Also report:
+- `pages_processed` / `pages_succeeded` — note any failures
+- `original_deleted` — confirm if user requested deletion
+- `delete_note` — if present, report it
+- Any page with `note: "Could not classify — filed to /Inbox/"` — flag for user action
 
 ---
 
@@ -181,6 +201,8 @@ After the tool returns, report each page's `filed_at` and `filename`. Flag any p
 - `pages` — page count
 - One-line OCR preview
 - `date` — always report the document date in ISO format (`YYYY-MM-DD`). If the document has no date, use today's date.
+- `confidence` — a 0–1 score. If `confidence < 0.5` AND `word_count < 20`, warn the user that OCR quality may be unreliable. Do NOT call `ocr__enhance_image_for_ocr` manually — enhancement runs automatically.
+- `filed_at` will be `null` for the `event` profile — event documents are not uploaded to Nextcloud. Do not report "filed to null"; proceed with the event→calendar workflow instead.
 
 If filename looks wrong — check for these indicators:
 - Contains generic words: "scan", "retry", "paper", "document", "flatbed"
@@ -206,8 +228,26 @@ Then:
 | "Error during device I/O" / scanner timeout | Canon is in Auto Shutdown sleep. Tell user to press any button on the printer. Suggest permanent fix: Menu → Preferences → Timer/Energy Settings → Auto Shutdown Time → Off |
 | "Invalid argument" | Try `profile: "doc-color"` or switch to flatbed |
 | No files in media/inbound | User hasn't attached an image yet; ask them to attach one |
-| `merged-no-ocr` in `pdf_method` result | OCR failed — file uploaded without text layer, not searchable. Warn user. |
+| `merged-no-ocr` in `pdf_method` result | Scan succeeded but all OCR methods failed — file is uploaded but has no searchable text layer. Tell the user: "The document was filed but the PDF is not searchable. You may want to re-scan." |
+| `source_path must point to a .pdf file` | Path passed to `split_and_refile` doesn't end in `.pdf`. Correct the path and retry. |
+| `This PDF has only 1 page — nothing to split` | Use `ocr__nextcloud_move` to rename or refile it instead. |
+| `Nextcloud download failed: HTTP 404` | File not found — check `source_path` spelling and case. |
+| `Nextcloud upload failed: HTTP 507` | Nextcloud storage quota exceeded. |
+| `polycr service HTTP 5xx` | Remote OCR service is down. Pipeline automatically falls back to local Tesseract — scan will still complete. |
 | Agent mentions saned / scanimage / SANE daemon | That is wrong. Call `ocr__quick_scan` immediately. |
+
+---
+
+## `pdf_method` values
+
+| Value | Meaning |
+|-------|---------|
+| `polycr` | Full-quality searchable PDF from the remote OCR service |
+| `ocrmypdf-local` | Searchable PDF from local ocrmypdf CLI (remote service unavailable) |
+| `tesseract-local` | Searchable PDF from local Tesseract fallback — quality may be lower |
+| `merged-no-ocr` | All PDF methods failed — file uploaded but not searchable |
+| `jpeg-only` | Photo or event profile — a JPEG was filed, not a PDF |
+| `existing-text-layer` | (split_and_refile only) Page already had an embedded text layer; no re-OCR needed |
 
 ---
 
