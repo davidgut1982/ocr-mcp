@@ -476,21 +476,35 @@ function classifyDocumentForFiling(text, profile, description) {
 // Test: Mock fetch to return '{"choices":[{"message":{"content":"Verizon_Wireless_Bill"}}]}';
 //       assert return value is "Verizon_Wireless_Bill".
 //       Mock fetch to throw; assert return value is null.
-async function generateSlugWithLLM(ocrText, classification) {
+// Why: Extracts both the document date and a vendor-identifying slug in one LLM call,
+//      eliminating fragile regex date patterns that miss real-world date formats.
+// What: Calls the LLM with a two-line response format; parses line 1 as YYYY-MM-DD date
+//       and line 2 as a filename slug. Falls back to today's date if the date line is
+//       missing or malformed.
+// Test: Call with text containing "Invoice Date: November 7, 2025" from "DeCraenes Service
+//       Center"; assert result is { date: '2025-11-07', slug: 'DeCraenes_Service_Center_Invoice' }.
+async function generateFilenamePartsWithLLM(ocrText, classification) {
   try {
+    const today = new Date().toISOString().split('T')[0];
     const snippet = ocrText.slice(0, 600);
     const prompt =
-      `Generate a concise filename slug for this document (2-4 words, underscores between words, title case). ` +
-      `The slug MUST start with the business or vendor name found in the OCR text — ` +
-      `that is, the company or person who sent, issued, or performed the service described in the document ` +
-      `(e.g. "DeCraenes", "OConnor Electric", "Verizon", "Rocket Mortgage"). ` +
-      `Do NOT use the vehicle make or model (e.g. Subaru, Toyota, Honda) as the filename — ` +
-      `those appear in the classification path only as a filing destination, not as the vendor. ` +
-      `Remove apostrophes entirely (O'Connor → OConnor, not O_Connor). ` +
-      `The classification path "${classification.path}" is only a routing hint, NOT the source of the filename. ` +
-      `OCR text: ${snippet}. ` +
-      `Return ONLY the slug, nothing else. ` +
-      `Example outputs: DeCraenes_Service_Center_Invoice, OConnor_Electric_Invoice, Rocket_Mortgage_Statement, Verizon_Wireless_Bill`;
+      `You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.\n\n` +
+      `Return EXACTLY two lines:\n` +
+      `Line 1: The document date in ISO format YYYY-MM-DD. If no date is found, return ${today} in ISO format.\n` +
+      `Line 2: A filename slug: 2-4 words, underscores between words, TitleCase each word.\n\n` +
+      `Rules for the slug:\n` +
+      `- MUST start with the business or vendor name found in the OCR text (who sent, issued, or performed the service)\n` +
+      `- Do NOT use vehicle make/model (Subaru, Toyota, etc.) — those are the filing destination, not the vendor\n` +
+      `- Remove apostrophes entirely (O'Connor → OConnor)\n` +
+      `- The classification path "${classification.path}" is a routing hint only, not the source of the filename\n\n` +
+      `Today's date is ${today}.\n\n` +
+      `Example output:\n` +
+      `2025-11-07\n` +
+      `DeCraenes_Service_Center_Invoice\n\n` +
+      `Example output:\n` +
+      `2024-03-15\n` +
+      `OConnor_Electric_Invoice\n\n` +
+      `OCR text: ${snippet}`;
 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 15000);
@@ -508,7 +522,7 @@ async function generateSlugWithLLM(ocrText, classification) {
             { role: 'system', content: 'You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.' },
             { role: 'user', content: prompt },
           ],
-          max_tokens: 32,
+          max_tokens: 48,
           temperature: 0,
         }),
         signal: ac.signal,
@@ -520,13 +534,24 @@ async function generateSlugWithLLM(ocrText, classification) {
     const data = await resp.json();
     const raw = data?.choices?.[0]?.message?.content;
     if (!raw || typeof raw !== 'string') return null;
-    const slug = raw.trim()
+
+    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    if (lines.length < 2) return null;
+
+    const dateLine = lines[0];
+    const slugLine = lines[1];
+
+    // Validate ISO date format; fall back to today if malformed.
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(dateLine) ? dateLine : today;
+
+    const slug = slugLine
       .replace(/['\u2018\u2019\u02BC]/g, '')
       .replace(/[^a-zA-Z0-9_]/g, '_')
       .replace(/_+/g, '_')
       .replace(/^_|_$/g, '')
       .slice(0, 60);
-    return slug.length >= 3 ? slug : null;
+
+    return (slug.length >= 3) ? { date, slug } : null;
   } catch (_) {
     return null;
   }
@@ -534,12 +559,18 @@ async function generateSlugWithLLM(ocrText, classification) {
 
 // Why: Produces consistent, date-prefixed filenames from OCR text so documents are
 //      sortable by date without manual renaming.
-// What: Tries LLM-based slug generation first; falls back to extractTitleSlug heuristics
-//       on any failure. Extracts first recognizable date from text (ISO, US, or long-form
-//       month); falls back to today.
+// What: Tries LLM-based date+slug extraction first (one call); falls back to regex date
+//       extraction and extractTitleSlug heuristics on any LLM failure.
 // Test: Call with text="SUMMER ENRICHMENT PROGRAM\nJune 1, 2026" ext="pdf";
 //       assert result starts with "2026-06-01_".
 async function generateFilename(text, classification, description, ext) {
+  // Try LLM-based date+slug extraction first (one call for both fields).
+  const llmParts = await generateFilenamePartsWithLLM(text, classification);
+  if (llmParts) {
+    return `${llmParts.date}_${llmParts.slug}.${ext}`;
+  }
+
+  // Fallback: regex date extraction + heuristic slug generation.
   const months = {
     january:'01', february:'02', march:'03',    april:'04',
     may:'05',     june:'06',     july:'07',      august:'08',
@@ -610,12 +641,8 @@ async function generateFilename(text, classification, description, ext) {
   // fallback: today
   if (!dateStr) dateStr = new Date().toISOString().split('T')[0];
 
-  // Try LLM-based slug first; fall back to heuristics on failure.
-  const llmSlug = await generateSlugWithLLM(text, classification);
   let slug;
-  if (llmSlug) {
-    return `${dateStr}_${llmSlug}.${ext}`;
-  } else {
+  {
     const ocrTitle = extractTitleSlug(text);
     // If the OCR title is too short after slug-cleaning (token fallback produced < 5 chars),
     // prefer the caller-supplied description which is usually more informative.
