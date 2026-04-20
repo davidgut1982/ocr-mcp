@@ -2095,12 +2095,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: msg }) }], isError: true };
       }
 
-      // Get page count via ImageMagick identify
+      // Get page count via pdfinfo (purpose-built, no rendering required)
       let pageCount;
       try {
-        const identifyOut = execSync(`identify ${JSON.stringify(sourcePdf)} 2>/dev/null | wc -l`, { timeout: 30000 }).toString().trim();
-        pageCount = parseInt(identifyOut, 10);
-        if (!pageCount || pageCount < 1) throw new Error('identify returned 0');
+        const pdfInfoOut = execSync(`pdfinfo ${JSON.stringify(sourcePdf)} 2>/dev/null`, { timeout: 10000 }).toString();
+        const pagesMatch = pdfInfoOut.match(/^Pages:\s+(\d+)/m);
+        pageCount = pagesMatch ? parseInt(pagesMatch[1], 10) : 0;
+        if (!pageCount || pageCount < 1) throw new Error('pdfinfo returned 0 pages');
       } catch (_) {
         return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Could not determine page count — is this a valid PDF?' }) }], isError: true };
       }
@@ -2116,7 +2117,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         };
       }
 
-      await sendProgress(0, pageCount, `${pageCount} page(s) found — starting split`);
+      // Split all pages at once via pdfseparate (preserves internal PDF structure, no re-encoding).
+      // gs -sDEVICE=pdfwrite was previously used here but it re-renders the PDF — while it does
+      // NOT corrupt ToUnicode CMaps, pdfseparate is faster and more appropriate for this task.
+      await sendProgress(0, pageCount, `${pageCount} page(s) found — splitting`);
+      const splitPattern = `/tmp/split_${timestamp}_p%d.pdf`;
+      execSync(`pdfseparate ${JSON.stringify(sourcePdf)} ${JSON.stringify(splitPattern)}`, { timeout: 60000 });
 
       const usedFilenames = new Set();
       const results = [];
@@ -2125,35 +2131,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       for (let i = 1; i <= pageCount; i++) {
         const splitPdf  = `/tmp/split_${timestamp}_p${i}.pdf`;
         const splitJpeg = `/tmp/split_${timestamp}_p${i}.jpg`;
-        const textFile  = `/tmp/split_${timestamp}_p${i}_text.txt`;
-        allTempFiles.push(splitPdf, splitJpeg, textFile);
+        allTempFiles.push(splitPdf, splitJpeg);
 
         try {
-          // Step A: Extract single page via Ghostscript
-          await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — splitting`);
-          execSync(
-            `gs -dBATCH -dNOPAUSE -q -sDEVICE=pdfwrite -dFirstPage=${i} -dLastPage=${i} -sOutputFile=${JSON.stringify(splitPdf)} ${JSON.stringify(sourcePdf)}`,
-            { timeout: 60000 }
-          );
-
-          // Step B: Extract text from existing text layer (fast — no network, no OCR service).
-          // The source PDF was already OCR'd, so each split page carries a text layer.
-          // Using gs txtwrite device avoids re-running polycr/LLM (~150s saved per page).
+          // Step A: Extract text via pdftotext (poppler).
+          // Root cause of the previous gs txtwrite failure: ocrmypdf/Tesseract text layers store
+          // each character at its exact pixel coordinate. gs txtwrite dumps chars in stream order
+          // (diagonal garbage). pdftotext reconstructs reading order from position data correctly.
           await sendProgress(i - 1, pageCount, `Page ${i} of ${pageCount} — extracting text`);
           let ocrText = '';
           let wordCount = 0;
           let confidence = 0;
           let pdfMethod = 'existing-text-layer';
           try {
-            execSync(
-              `gs -q -dBATCH -dNOPAUSE -sDEVICE=txtwrite -sOutputFile=${JSON.stringify(textFile)} ${JSON.stringify(splitPdf)}`,
-              { timeout: 30000 }
-            );
-            if (fs.existsSync(textFile)) {
-              ocrText = fs.readFileSync(textFile, 'utf8').trim();
-              wordCount = countWords(ocrText);
-              confidence = wordCount > 0 ? 0.9 : 0;
-            }
+            ocrText = execSync(`pdftotext ${JSON.stringify(splitPdf)} -`, { timeout: 10000 }).toString().trim();
+            wordCount = countWords(ocrText);
+            confidence = wordCount > 0 ? 0.9 : 0;
           } catch (_) {}
 
           // Step C: Fallback to full JPEG OCR if text layer is empty or sparse
