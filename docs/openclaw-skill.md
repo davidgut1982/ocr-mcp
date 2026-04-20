@@ -50,6 +50,26 @@ The Canon ADF always produces Color output regardless of profile. The `doc-bw-ad
 
 ## Decision tree — pick a path, don't ask
 
+### Profile selection
+
+| What David says | Profile |
+|---|---|
+| letter, form, bill, contract, statement | `doc-bw` |
+| multi-page document, stack of papers | `doc-bw-adf` |
+| color form, certificate, color doc | `doc-color` |
+| receipt, invoice | `receipt` |
+| ID, license, insurance card, passport | `id-card` |
+| photo, picture, image | `photo` |
+| invite, flyer, event | `event` |
+
+Default call format:
+```
+ocr__scan_and_file(profile="<profile>", description="<optional hint>")
+```
+When scanning multiple separate documents, add `separate_pages=true`.
+
+---
+
 ### Attached image in chat
 When `[media attached: media://inbound/<id>]` appears in the message:
 1. **Immediately call `ocr__ocr_inbound_media`** — extract `<id>` and pass as `media_id`
