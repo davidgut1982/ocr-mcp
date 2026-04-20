@@ -488,22 +488,27 @@ async function generateFilenamePartsWithLLM(ocrText, classification) {
     const today = new Date().toISOString().split('T')[0];
     const snippet = ocrText.slice(0, 1200);
     const prompt =
-      `You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.\n\n` +
+      `You are a document filing assistant. Extract the document date and generate a filename slug.\n\n` +
       `Return EXACTLY two lines:\n` +
-      `Line 1: The document date in ISO format YYYY-MM-DD. Search carefully for any date in the text (invoice date, service date, date of service, statement date, etc.). If you cannot find any date, return the word UNKNOWN.\n` +
-      `Line 2: A filename slug: 2-4 words, underscores between words, TitleCase each word.\n\n` +
-      `Rules for the slug:\n` +
-      `- MUST start with the business or vendor name found in the OCR text (who sent, issued, or performed the service)\n` +
-      `- Do NOT use vehicle make/model (Subaru, Toyota, etc.) — those are the filing destination, not the vendor\n` +
-      `- Remove apostrophes entirely (O'Connor → OConnor)\n` +
-      `- The classification path "${classification.path}" is a routing hint only, not the source of the filename\n\n` +
-      `Example output:\n` +
-      `2025-11-07\n` +
-      `DeCraenes_Service_Center_Invoice\n\n` +
-      `Example output (no date found):\n` +
-      `UNKNOWN\n` +
-      `OConnor_Electric_Invoice\n\n` +
-      `OCR text: ${snippet}`;
+      `Line 1: The document date in ISO format YYYY-MM-DD.\n` +
+      `Line 2: A filename slug: 2-4 words, underscores, TitleCase.\n\n` +
+      `DATE RULES — be aggressive, not rigid:\n` +
+      `- Search everywhere: invoice date, service date, date of service, statement date, order date, completed date, any date field\n` +
+      `- Two-digit years: 08/25/25 = 2025-08-25, 07/21/25 = 2025-07-21 (years 00-30 = 20xx, 31-99 = 19xx)\n` +
+      `- Long-form dates: "{Monday, August 25, 2025, 12:29 pm}" = 2025-08-25\n` +
+      `- Abbreviated months: Nov 7 2025 = 2025-11-07, Dec. 3 2024 = 2024-12-03\n` +
+      `- Noisy/handwritten OCR: make your best effort to interpret garbled date-like text near labels like "DATE:", "Date Ordered:", "Invoice Date:"\n` +
+      `- Only return UNKNOWN if there is absolutely no date-related text anywhere in the document\n\n` +
+      `SLUG RULES:\n` +
+      `- MUST start with the business or vendor name from the OCR text (who sent or performed the service)\n` +
+      `- Do NOT use vehicle make/model — those are filing destinations, not vendors\n` +
+      `- Remove apostrophes (O'Connor → OConnor)\n` +
+      `- "${classification.path}" is routing only, not the filename source\n\n` +
+      `Examples:\n` +
+      `2025-08-25\nDeCraenes_Service_Center_Invoice\n\n` +
+      `2025-07-21\nDeCraenes_Service_Center_Invoice\n\n` +
+      `UNKNOWN\nOConnor_Electric_Invoice\n\n` +
+      `OCR text:\n${snippet}`;
 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 15000);
@@ -521,7 +526,7 @@ async function generateFilenamePartsWithLLM(ocrText, classification) {
             { role: 'system', content: 'You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.' },
             { role: 'user', content: prompt },
           ],
-          max_tokens: 48,
+          max_tokens: 64,
           temperature: 0,
         }),
         signal: ac.signal,
