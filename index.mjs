@@ -190,7 +190,7 @@ function pickBestPolycr(data) {
 //       assert return value is "reconciled text".
 //       Mock fetch to throw; assert return value is null.
 async function reconcileOcrWithLLM(engineResults) {
-  if (!engineResults || engineResults.length < 2) return null;
+  if (!engineResults || engineResults.length < 1) return null;
 
   const versionsText = engineResults
     .map((r, i) => `--- Engine ${i + 1} (${r.engine}) ---\n${r.text.trim()}`)
@@ -268,9 +268,9 @@ async function ocrWithFallback(filePath) {
       .filter(r => r && typeof r.text === 'string' && !r.error && countWords(r.text) > 0)
       .map(r => ({ engine: r.engine || 'unknown', text: r.text }));
 
-    // Try LLM reconciliation when 2+ engines produced output — this gives the
-    // highest-quality text by letting the model resolve disagreements.
-    if (engineResults.length >= 2) {
+    // Try LLM reconciliation whenever at least 1 engine produced output.
+    // Even a single engine result benefits from LLM correction of typos and proper nouns.
+    if (engineResults.length >= 1) {
       const reconciled = await reconcileOcrWithLLM(engineResults);
       if (reconciled && countWords(reconciled) > 0) {
         return {
