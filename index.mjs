@@ -282,6 +282,7 @@ async function ocrWithFallback(filePath) {
           fallback_reason: undefined,
         };
       }
+      console.error(`ocrWithFallback: LLM reconciliation returned null, falling back to pickBestPolycr`);
     }
 
     // LLM unavailable or only 1 engine — fall back to consensus scoring
@@ -298,6 +299,7 @@ async function ocrWithFallback(filePath) {
       };
     }
   }
+  console.error(`ocrWithFallback: polycr unavailable (${fallback_reason || 'no result'}), falling back to local Tesseract`);
   const local = await runLocalTesseract(filePath);
   return {
     text: local.text,
@@ -1935,12 +1937,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       let ocrText = '';
       let wordCount = 0;
       let confidence = 0;
+      let ocrEngineUsed = null;
+      let ocrFallbackReason = null;
 
       if (profile !== 'photo') {
         const ocrResult = await ocrWithFallback(tmpJpeg);
         ocrText = ocrResult.text || '';
         wordCount = ocrResult.word_count || 0;
         confidence = ocrResult.confidence || 0;
+        ocrEngineUsed = ocrResult.engine_used || null;
+        ocrFallbackReason = ocrResult.fallback_reason || null;
 
         // Low-confidence retry with image enhancement
         if (wordCount < 10) {
@@ -1953,6 +1959,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
               ocrText = enhancedResult.text || '';
               wordCount = enhancedResult.word_count || 0;
               confidence = enhancedResult.confidence || 0;
+              ocrEngineUsed = enhancedResult.engine_used || null;
+              ocrFallbackReason = enhancedResult.fallback_reason || null;
             }
           } catch (_) {
             // enhancement failed — keep original OCR result
@@ -2008,6 +2016,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         word_count: wordCount,
         confidence: Math.round(confidence * 100) / 100,
         ocr_preview: ocrText.slice(0, 300).trim() || null,
+        engine_used: ocrEngineUsed || undefined,
+        fallback_reason: ocrFallbackReason || undefined,
       };
 
       if (profile === 'event') {
@@ -2085,12 +2095,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         let ocrText = '';
         let wordCount = 0;
         let confidence = 0;
+        let ocrEngineUsed = null;
+        let ocrFallbackReason = null;
 
         if (profile !== 'photo') {
           const ocrResult = await ocrWithFallback(pageJpegs[0]);
           ocrText = ocrResult.text || '';
           wordCount = ocrResult.word_count || 0;
           confidence = ocrResult.confidence || 0;
+          ocrEngineUsed = ocrResult.engine_used || null;
+          ocrFallbackReason = ocrResult.fallback_reason || null;
 
           // Low-confidence retry with image enhancement on page 1
           if (wordCount < 10) {
@@ -2103,6 +2117,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
                 ocrText = enhancedResult.text || '';
                 wordCount = enhancedResult.word_count || 0;
                 confidence = enhancedResult.confidence || 0;
+                ocrEngineUsed = enhancedResult.engine_used || null;
+                ocrFallbackReason = enhancedResult.fallback_reason || null;
               }
             } catch (_) {
               // enhancement failed — keep original OCR result
@@ -2205,6 +2221,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           word_count: wordCount,
           confidence: Math.round(confidence * 100) / 100,
           ocr_preview: ocrText.slice(0, 300).trim() || null,
+          engine_used: ocrEngineUsed || undefined,
+          fallback_reason: ocrFallbackReason || undefined,
         };
 
         if (profile === 'event') {
