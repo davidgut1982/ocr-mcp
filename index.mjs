@@ -45,6 +45,11 @@ const LITELLM_URL = process.env.LITELLM_URL || 'http://192.168.1.19:4000/v1/chat
 const LITELLM_KEY = process.env.LITELLM_KEY || 'sk-litellm-openclaw';
 const LITELLM_MODEL = process.env.LITELLM_MODEL || 'auto';
 
+// Why: Provides a promisified sleep for async retry loops and rate-limit backoff.
+// What: Returns a Promise that resolves after `ms` milliseconds.
+// Test: Assert `await delay(50)` completes without error and takes ~50ms.
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 // Helper: derive default output path from input path
 function defaultOutputPath(filePath) {
   const dir = path.dirname(filePath);
@@ -197,36 +202,54 @@ async function reconcileOcrWithLLM(engineResults) {
     `Output ONLY the reconciled document text. Do not add commentary, headers, labels, or explanations. Preserve the original document structure and line breaks as faithfully as possible.\n\n` +
     versionsText;
 
-  try {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 30000);
-    let resp;
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      resp = await fetch(LITELLM_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${LITELLM_KEY}`,
-        },
-        body: JSON.stringify({
-          model: LITELLM_MODEL,
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 4096,
-          temperature: 0,
-        }),
-        signal: ac.signal,
-      });
-    } finally {
-      clearTimeout(timer);
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 30000);
+      let resp;
+      try {
+        resp = await fetch(LITELLM_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${LITELLM_KEY}`,
+          },
+          body: JSON.stringify({
+            model: LITELLM_MODEL,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 4096,
+            temperature: 0,
+          }),
+          signal: ac.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!resp.ok) {
+        console.error(`reconcileOcrWithLLM: attempt ${attempt} failed with HTTP ${resp.status}`);
+        if (resp.status === 429) {
+          if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
+          continue;
+        } else if (resp.status >= 500) {
+          if (attempt < 3) await new Promise(r => setTimeout(r, 500));
+          continue;
+        } else {
+          break;
+        }
+      }
+      const data = await resp.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content || typeof content !== 'string' || content.trim().length === 0) {
+        console.error(`reconcileOcrWithLLM: attempt ${attempt} returned empty or invalid content`);
+        break;
+      }
+      return content.trim();
+    } catch (err) {
+      console.error(`reconcileOcrWithLLM: attempt ${attempt} threw`, err);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 200));
     }
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content || typeof content !== 'string' || content.trim().length === 0) return null;
-    return content.trim();
-  } catch (_) {
-    return null;
   }
+  return null;
 }
 
 // Why: Provides transparent OCR with automatic fallback so callers don't need to manage service availability.
@@ -470,85 +493,107 @@ function classifyDocumentForFiling(text, profile, description) {
 // Test: Call with text containing "Invoice Date: November 7, 2025" from "DeCraenes Service
 //       Center"; assert result is { date: '2025-11-07', slug: 'DeCraenes_Service_Center_Invoice' }.
 async function generateFilenamePartsWithLLM(ocrText, classification) {
-  try {
-    const today = new Date().toISOString().split('T')[0];
-    const snippet = ocrText.slice(0, 1200);
-    const prompt =
-      `You are a document filing assistant. Extract the document date and generate a filename slug.\n\n` +
-      `Return EXACTLY two lines:\n` +
-      `Line 1: The document date in ISO format YYYY-MM-DD.\n` +
-      `Line 2: A filename slug: 2-4 words, underscores, TitleCase.\n\n` +
-      `DATE RULES — be aggressive, not rigid:\n` +
-      `- Search everywhere: invoice date, service date, date of service, statement date, order date, completed date, any date field\n` +
-      `- Two-digit years: 08/25/25 = 2025-08-25, 07/21/25 = 2025-07-21 (years 00-30 = 20xx, 31-99 = 19xx)\n` +
-      `- Long-form dates: "{Monday, August 25, 2025, 12:29 pm}" = 2025-08-25\n` +
-      `- Abbreviated months: Nov 7 2025 = 2025-11-07, Dec. 3 2024 = 2024-12-03\n` +
-      `- Noisy/handwritten OCR: make your best effort to interpret garbled date-like text near labels like "DATE:", "Date Ordered:", "Invoice Date:"\n` +
-      `- Only return UNKNOWN if there is absolutely no date-related text anywhere in the document\n\n` +
-      `SLUG RULES:\n` +
-      `- MUST start with the business or vendor name from the OCR text (who sent or performed the service)\n` +
-      `- Do NOT use vehicle make/model — those are filing destinations, not vendors\n` +
-      `- Remove apostrophes (O'Connor → OConnor)\n` +
-      `- "${classification.path}" is routing only, not the filename source\n\n` +
-      `Examples:\n` +
-      `2025-08-25\nDeCraenes_Service_Center_Invoice\n\n` +
-      `2025-07-21\nDeCraenes_Service_Center_Invoice\n\n` +
-      `UNKNOWN\nOConnor_Electric_Invoice\n\n` +
-      `OCR text:\n${snippet}`;
+  const today = new Date().toISOString().split('T')[0];
+  const snippet = ocrText.slice(0, 1200);
+  const prompt =
+    `You are a document filing assistant. Extract the document date and generate a filename slug.\n\n` +
+    `Return EXACTLY two lines:\n` +
+    `Line 1: The document date in ISO format YYYY-MM-DD.\n` +
+    `Line 2: A filename slug: 2-4 words, underscores, TitleCase.\n\n` +
+    `DATE RULES — be aggressive, not rigid:\n` +
+    `- Search everywhere: invoice date, service date, date of service, statement date, order date, completed date, any date field\n` +
+    `- Two-digit years: 08/25/25 = 2025-08-25, 07/21/25 = 2025-07-21 (years 00-30 = 20xx, 31-99 = 19xx)\n` +
+    `- Long-form dates: "{Monday, August 25, 2025, 12:29 pm}" = 2025-08-25\n` +
+    `- Abbreviated months: Nov 7 2025 = 2025-11-07, Dec. 3 2024 = 2024-12-03\n` +
+    `- Noisy/handwritten OCR: make your best effort to interpret garbled date-like text near labels like "DATE:", "Date Ordered:", "Invoice Date:"\n` +
+    `- Only return UNKNOWN if there is absolutely no date-related text anywhere in the document\n\n` +
+    `SLUG RULES:\n` +
+    `- MUST start with the business or vendor name from the OCR text (who sent or performed the service)\n` +
+    `- Do NOT use vehicle make/model — those are filing destinations, not vendors\n` +
+    `- Remove apostrophes (O'Connor → OConnor)\n` +
+    `- "${classification.path}" is routing only, not the filename source\n\n` +
+    `Examples:\n` +
+    `2025-08-25\nDeCraenes_Service_Center_Invoice\n\n` +
+    `2025-07-21\nDeCraenes_Service_Center_Invoice\n\n` +
+    `UNKNOWN\nOConnor_Electric_Invoice\n\n` +
+    `OCR text:\n${snippet}`;
 
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 15000);
-    let resp;
+  let raw = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      resp = await fetch(LITELLM_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${LITELLM_KEY}`,
-        },
-        body: JSON.stringify({
-          model: LITELLM_MODEL,
-          messages: [
-            { role: 'system', content: 'You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.' },
-            { role: 'user', content: prompt },
-          ],
-          max_tokens: 64,
-          temperature: 0,
-        }),
-        signal: ac.signal,
-      });
-    } finally {
-      clearTimeout(timer);
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 15000);
+      let resp;
+      try {
+        resp = await fetch(LITELLM_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${LITELLM_KEY}`,
+          },
+          body: JSON.stringify({
+            model: LITELLM_MODEL,
+            messages: [
+              { role: 'system', content: 'You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.' },
+              { role: 'user', content: prompt },
+            ],
+            max_tokens: 64,
+            temperature: 0,
+          }),
+          signal: ac.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!resp.ok) {
+        console.error(`generateFilenamePartsWithLLM: attempt ${attempt} failed with HTTP ${resp.status}`);
+        if (resp.status === 429) {
+          if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
+          continue;
+        } else if (resp.status >= 500) {
+          if (attempt < 3) await new Promise(r => setTimeout(r, 500));
+          continue;
+        } else {
+          break;
+        }
+      }
+      const data = await resp.json();
+      const candidate = data?.choices?.[0]?.message?.content;
+      if (!candidate || typeof candidate !== 'string') {
+        console.error(`generateFilenamePartsWithLLM: attempt ${attempt} returned empty or invalid content`);
+        break;
+      }
+      raw = candidate;
+      break;
+    } catch (err) {
+      console.error(`generateFilenamePartsWithLLM: attempt ${attempt} threw`, err);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 200));
     }
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const raw = data?.choices?.[0]?.message?.content;
-    if (!raw || typeof raw !== 'string') return null;
-
-    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-    if (lines.length < 2) return null;
-
-    const dateLine = lines[0];
-    const slugLine = lines[1];
-
-    // If date line is UNKNOWN, return null date so caller falls through to regex chain.
-    // If date line is a valid ISO date, use it. Otherwise treat as unknown.
-    const dateValid = /^\d{4}-\d{2}-\d{2}$/.test(dateLine);
-    const date = dateValid ? dateLine : null;
-
-    const slug = slugLine
-      .replace(/['\u2018\u2019\u02BC]/g, '')
-      .replace(/[^a-zA-Z0-9_]/g, '_')
-      .replace(/_+/g, '_')
-      .replace(/^_|_$/g, '')
-      .slice(0, 60);
-
-    if (slug.length < 3) return null;
-    // Return slug always; date may be null (caller will run regex fallback for date).
-    return { date, slug };
-  } catch (_) {
-    return null;
   }
+
+  if (!raw) return null;
+
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length < 2) return null;
+
+  const dateLine = lines[0];
+  const slugLine = lines[1];
+
+  // If date line is UNKNOWN, return null date so caller falls through to regex chain.
+  // If date line is a valid ISO date, use it. Otherwise treat as unknown.
+  const dateValid = /^\d{4}-\d{2}-\d{2}$/.test(dateLine);
+  const date = dateValid ? dateLine : null;
+
+  const slug = slugLine
+    .replace(/['\u2018\u2019\u02BC]/g, '')
+    .replace(/[^a-zA-Z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .slice(0, 60);
+
+  if (slug.length < 3) return null;
+  // Return slug always; date may be null (caller will run regex fallback for date).
+  return { date, slug };
 }
 
 // Why: Produces consistent, date-prefixed filenames from OCR text so documents are
