@@ -38,6 +38,10 @@ const NEXTCLOUD_WEBDAV_BASE = `${NEXTCLOUD_URL}/remote.php/dav/files/${NEXTCLOUD
 // NextDocument fetches within a single job.
 const CANON_ESCL_BASE = process.env.CANON_ESCL_BASE || 'http://192.168.1.141';
 
+// Minimum JPEG file size (bytes) below which a scanned page is treated as blank and discarded.
+// A blank white page at 300 DPI in Color JPEG is typically 10–40 KB; a page with text is 150 KB+.
+const BLANK_PAGE_THRESHOLD_BYTES = 50_000;
+
 // LiteLLM proxy — OpenAI-compatible endpoint on the local network.
 // Used for LLM-based OCR reconciliation: all engine outputs are fed to the
 // LLM and it returns the best possible merged transcription.
@@ -898,6 +902,15 @@ async function clearStuckEsclJobs() {
   }
 }
 
+// Why: Drives a multi-page ADF scan on the Canon MF741C using the eSCL HTTP API directly,
+//      capturing both sides of each sheet (duplex) and discarding blank back pages so
+//      single-sided documents don't produce empty pages in the output PDF.
+// What: Posts a ScanJob with Duplex=true and Feeder source, then fetches NextDocument in a
+//       loop until 404 (ADF empty). Pages smaller than BLANK_PAGE_THRESHOLD_BYTES are
+//       deleted from disk and skipped — they are blank back sides of single-sided sheets.
+// Test: Supply a two-sheet duplex scan where sheets 1 and 2 have content only on the front.
+//       Assert four raw page files are written, two are discarded (back sides < 50 KB),
+//       and pageJpegs contains exactly two paths.
 async function scanAdfViaEscl(timestamp, colorMode, resolution) {
   await clearStuckEsclJobs();
   const scanXml = [
@@ -915,6 +928,7 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution) {
     '    </pwg:ScanRegion>',
     '  </pwg:ScanRegions>',
     '  <pwg:InputSource>Feeder</pwg:InputSource>',
+    '  <scan:Duplex>true</scan:Duplex>',
     `  <scan:ColorMode>${colorMode === 'Color' ? 'RGB24' : 'Grayscale8'}</scan:ColorMode>`,
     `  <scan:XResolution>${resolution}</scan:XResolution>`,
     `  <scan:YResolution>${resolution}</scan:YResolution>`,
@@ -965,6 +979,12 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution) {
 
       const pageFile = `/tmp/scan_${timestamp}_p${pageNum}.jpg`;
       fs.writeFileSync(pageFile, pageData);
+      // Discard blank pages — duplex scanning produces a back-side image for every sheet,
+      // which is blank when the document is single-sided. Threshold: < 50 KB = blank.
+      if (pageData.length < BLANK_PAGE_THRESHOLD_BYTES) {
+        fs.unlinkSync(pageFile);
+        continue;
+      }
       pageJpegs.push(pageFile);
     }
   } finally {
