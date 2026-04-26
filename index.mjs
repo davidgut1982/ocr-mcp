@@ -39,8 +39,9 @@ const NEXTCLOUD_WEBDAV_BASE = `${NEXTCLOUD_URL}/remote.php/dav/files/${NEXTCLOUD
 const CANON_ESCL_BASE = process.env.CANON_ESCL_BASE || 'http://192.168.1.141';
 
 // Minimum JPEG file size (bytes) below which a scanned page is treated as blank and discarded.
-// A blank white page at 300 DPI in Color JPEG is typically 10–40 KB; a page with text is 150 KB+.
-const BLANK_PAGE_THRESHOLD_BYTES = 50_000;
+// A blank white page at 300 DPI Color JPEG is 144–185 KB; a page with text is typically 500 KB–2 MB.
+// 200 KB provides good separation between blank and content pages.
+const BLANK_PAGE_THRESHOLD_BYTES = 200_000;
 
 // LiteLLM proxy — OpenAI-compatible endpoint on the local network.
 // Used for LLM-based OCR reconciliation: all engine outputs are fed to the
@@ -475,7 +476,7 @@ function classifyDocumentForFiling(text, profile, description) {
     return { type: 'legal',     path: '/Personal/Legal/' };
   if (lower.match(/lease|landlord|tenant|rental agreement|property/))
     return { type: 'housing',   path: '/Personal/Housing/' };
-  if (lower.match(/vehicle|registration|title|dmv|vin\b/))
+  if (lower.match(/vehicle|registration|vehicle\s*title|certificate\s*of\s*title|dmv|vin\b/))
     return { type: 'auto',      path: '/Personal/Auto/' };
   if (lower.match(/theodore|teddy|daycare|preschool/))
     return { type: 'theodore',  path: '/Personal/Theodore/' };
