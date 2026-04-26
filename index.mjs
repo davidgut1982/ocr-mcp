@@ -860,7 +860,46 @@ function extractTitleSlug(text) {
 //       Returns array of absolute JPEG paths in page order.
 // Test: Mock fetch to return 201 with Location header, then 200 for 2 pages, then 404;
 //       assert return value has 2 file paths and both files contain the mocked JPEG data.
+
+// Why: Canon MF741C returns HTTP 500 on POST /eSCL/ScanJobs if a previous job is still
+//      registered (zombie job from a crashed/killed process that skipped its finally-DELETE).
+//      This pre-flight clears any active/processing jobs so the next POST succeeds.
+// What: GETs /eSCL/ScannerStatus, parses JobUri elements from all non-completed jobs,
+//       fires DELETE on each, waits up to 3s for the printer to process them, then returns.
+//       Errors are swallowed — if we can't clear, we proceed anyway and let the POST fail
+//       with a meaningful error rather than hanging here.
+// Test: Mock ScannerStatus to return XML with a JobUri, assert DELETE is called on that URI;
+//       mock ScannerStatus to return non-OK, assert function returns without throwing.
+async function clearStuckEsclJobs() {
+  try {
+    const statusResp = await fetch(`${CANON_ESCL_BASE}/eSCL/ScannerStatus`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!statusResp.ok) return;
+    const xml = await statusResp.text();
+
+    // Extract all JobUri values — these are the active/processing job URLs
+    const jobUriMatches = xml.matchAll(/<(?:[^:>]+:)?JobUri>([^<]+)<\/(?:[^:>]+:)?JobUri>/g);
+    const jobUris = [...jobUriMatches].map(m => m[1].trim());
+    if (jobUris.length === 0) return;
+
+    // DELETE each stuck job (fire-and-forget per job, but await all)
+    await Promise.allSettled(
+      jobUris.map(uri => {
+        const url = uri.startsWith('http') ? uri : `${CANON_ESCL_BASE}${uri}`;
+        return fetch(url, { method: 'DELETE', signal: AbortSignal.timeout(3000) });
+      })
+    );
+
+    // Brief pause for the printer to release the job lock
+    await new Promise(resolve => setTimeout(resolve, 500));
+  } catch {
+    // Non-fatal — proceed with the scan attempt
+  }
+}
+
 async function scanAdfViaEscl(timestamp, colorMode, resolution) {
+  await clearStuckEsclJobs();
   const scanXml = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03"',
