@@ -1582,6 +1582,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
   if (name === "ocr_image_from_base64") {
     const { base64_data, mime_type } = args;
+    const mimeStr = typeof mime_type === 'string' ? mime_type : String(mime_type ?? '');
+    const b64Str = typeof base64_data === 'string' ? base64_data : String(base64_data ?? '');
 
     const allowedMimes = [
       "image/jpeg",
@@ -1591,7 +1593,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       "image/tiff",
       "image/bmp",
     ];
-    if (!allowedMimes.includes(mime_type)) {
+    if (!allowedMimes.includes(mimeStr)) {
       throw new Error(
         `Invalid mime_type. Must be one of: ${allowedMimes.join(", ")}`
       );
@@ -1605,11 +1607,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       "image/tiff": ".tiff",
       "image/bmp": ".bmp",
     };
-    const ext = extMap[mime_type];
+    const ext = extMap[mimeStr];
     const tempFile = path.join(os.tmpdir(), `ocr_b64_${Date.now()}${ext}`);
 
     try {
-      fs.writeFileSync(tempFile, Buffer.from(base64_data, "base64"));
+      fs.writeFileSync(tempFile, Buffer.from(b64Str, "base64"));
       const result = await ocrWithFallback(tempFile);
       const output = {
         text: result.text,
@@ -2032,7 +2034,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       // Step 3: Classify + generate filename (deduplicate same-second collisions)
       const classification = classifyDocumentForFiling(ocrText, profile, description);
       const ext = profile === 'photo' ? 'jpg' : 'pdf';
-      let baseFilename = filenameOverride || await generateFilename(ocrText, classification, description || '', ext);
+      const rawFilename = filenameOverride || await generateFilename(ocrText, classification, description || '', ext);
+      let baseFilename = typeof rawFilename === 'string' ? rawFilename : String(rawFilename ?? '');
       if (usedFilenames.has(baseFilename)) {
         // Append _p2, _p3 … before the extension to avoid collisions
         const dotIdx = baseFilename.lastIndexOf('.');
@@ -2550,13 +2553,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
   if (name === "ocr_inbound_media") {
     const { media_id, file_nextcloud = false, description } = args || {};
+    const mediaIdStr = typeof media_id === 'string' ? media_id : String(media_id ?? '');
     const inboundDir = path.join(os.homedir(), '.openclaw', 'media', 'inbound');
 
     // Find the target file
     let targetFile = null;
     if (media_id) {
       // Search for file whose name contains the media_id
-      const files = fs.readdirSync(inboundDir).filter(f => f.includes(media_id));
+      const files = fs.readdirSync(inboundDir).filter(f => f.includes(mediaIdStr));
       if (files.length > 0) {
         targetFile = path.join(inboundDir, files[0]);
       }
