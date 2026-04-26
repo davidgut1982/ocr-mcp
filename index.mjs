@@ -864,8 +864,8 @@ function extractTitleSlug(text) {
 // Why: Canon MF741C returns HTTP 500 on POST /eSCL/ScanJobs if a previous job is still
 //      registered (zombie job from a crashed/killed process that skipped its finally-DELETE).
 //      This pre-flight clears any active/processing jobs so the next POST succeeds.
-// What: GETs /eSCL/ScannerStatus, parses JobUri elements from all non-completed jobs,
-//       fires DELETE on each, waits up to 3s for the printer to process them, then returns.
+// What: GETs /eSCL/ScannerStatus, parses ALL JobUri elements regardless of job state,
+//       fires DELETE on each, waits 500ms for the printer to release the job lock, then returns.
 //       Errors are swallowed — if we can't clear, we proceed anyway and let the POST fail
 //       with a meaningful error rather than hanging here.
 // Test: Mock ScannerStatus to return XML with a JobUri, assert DELETE is called on that URI;
