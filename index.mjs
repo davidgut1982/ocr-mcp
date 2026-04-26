@@ -912,7 +912,7 @@ async function clearStuckEsclJobs() {
 // Test: Supply a two-sheet duplex scan where sheets 1 and 2 have content only on the front.
 //       Assert four raw page files are written, two are discarded (back sides < 50 KB),
 //       and pageJpegs contains exactly two paths.
-async function scanAdfViaEscl(timestamp, colorMode, resolution) {
+async function scanAdfViaEscl(timestamp, colorMode, resolution, onProgress) {
   await clearStuckEsclJobs();
   const scanXml = [
     '<?xml version="1.0" encoding="UTF-8"?>',
@@ -986,6 +986,7 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution) {
         continue;
       }
       pageJpegs.push(pageFile);
+      if (onProgress) onProgress(pageJpegs.length, `Scanned page ${pageJpegs.length}`);
     }
   } finally {
     // Always clean up the eSCL job — fire-and-forget, errors don't matter
@@ -1363,7 +1364,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "quick_scan",
-      description: "Scan whatever is in the Canon MF741C ADF (or flatbed if ADF empty) and file to Nextcloud automatically. Zero configuration needed — uses Canon MF741C + doc-bw-adf profile + auto-classification. Returns filed_at path and OCR preview.",
+      description: "Scan whatever is in the Canon MF741C ADF. Returns an error if ADF is empty. Zero configuration needed — uses Canon MF741C + doc-bw-adf profile + auto-classification. Returns filed_at path and OCR preview.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2115,7 +2116,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
         await sendProgress(0, -1, 'ADF scan starting — warming up scanner');
 
-        const pageJpegs = await scanAdfViaEscl(timestamp, scanMode, 300);
+        const pageJpegs = await scanAdfViaEscl(timestamp, scanMode, 300, (count, msg) => {
+          sendProgress(count, 99, msg);
+        });
         for (const f of pageJpegs) allTempFiles.push(f);
 
         if (pageJpegs.length === 0) {
@@ -2184,6 +2187,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             }
           }
         }
+
+        await sendProgress(60, 100, 'OCR complete');
 
         // Step 3: Classify + generate filename from page 1 OCR
         const classification = classifyDocumentForFiling(ocrText, profile, description);
@@ -2261,9 +2266,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           }
         }
 
+        await sendProgress(80, 100, 'PDF created');
+
         // Step 6: Upload single PDF to Nextcloud
         if (profile !== 'event' && ncPath) {
           await nextcloudUpload(fileToUpload, ncPath, filename);
+          await sendProgress(95, 100, 'Uploaded to Nextcloud');
         }
 
         // Build flat single-result response
