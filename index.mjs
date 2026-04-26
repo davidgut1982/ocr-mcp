@@ -905,7 +905,8 @@ async function clearStuckEsclJobs() {
 // Why: Drives a multi-page ADF scan on the Canon MF741C using the eSCL HTTP API directly,
 //      capturing both sides of each sheet (duplex) and discarding blank back pages so
 //      single-sided documents don't produce empty pages in the output PDF.
-// What: Posts a ScanJob with Duplex=true and Feeder source, then fetches NextDocument in a
+// What: Posts a ScanJob with AdfDuplex as the InputSource (Canon encodes duplex mode in the
+//       InputSource value, not as a separate element), then fetches NextDocument in a
 //       loop until 404 (ADF empty). Pages smaller than BLANK_PAGE_THRESHOLD_BYTES are
 //       deleted from disk and skipped — they are blank back sides of single-sided sheets.
 // Test: Supply a two-sheet duplex scan where sheets 1 and 2 have content only on the front.
@@ -927,8 +928,7 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution) {
     '      <pwg:YOffset>0</pwg:YOffset>',
     '    </pwg:ScanRegion>',
     '  </pwg:ScanRegions>',
-    '  <pwg:InputSource>Feeder</pwg:InputSource>',
-    '  <scan:Duplex>true</scan:Duplex>',
+    '  <pwg:InputSource>AdfDuplex</pwg:InputSource>',
     `  <scan:ColorMode>${colorMode === 'Color' ? 'RGB24' : 'Grayscale8'}</scan:ColorMode>`,
     `  <scan:XResolution>${resolution}</scan:XResolution>`,
     `  <scan:YResolution>${resolution}</scan:YResolution>`,
