@@ -39,9 +39,10 @@ const NEXTCLOUD_WEBDAV_BASE = `${NEXTCLOUD_URL}/remote.php/dav/files/${NEXTCLOUD
 const CANON_ESCL_BASE = process.env.CANON_ESCL_BASE || 'http://192.168.1.141';
 
 // Minimum JPEG file size (bytes) below which a scanned page is treated as blank and discarded.
-// A blank white page at 300 DPI Color JPEG is 144–185 KB; a page with text is typically 500 KB–2 MB.
-// 200 KB provides good separation between blank and content pages.
-const BLANK_PAGE_THRESHOLD_BYTES = 200_000;
+// Blank pages at 300 DPI Color are 144–185 KB, but in AdfDuplex mode the Canon uses Color.
+// Content pages with even light text are typically >150 KB. 100 KB catches true blanks while
+// keeping light-content pages.
+const BLANK_PAGE_THRESHOLD_BYTES = 100_000;
 
 // LiteLLM proxy — OpenAI-compatible endpoint on the local network.
 // Used for LLM-based OCR reconciliation: all engine outputs are fed to the
@@ -981,8 +982,9 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution, onProgress) {
       const pageFile = `/tmp/scan_${timestamp}_p${pageNum}.jpg`;
       fs.writeFileSync(pageFile, pageData);
       // Discard blank pages — duplex scanning produces a back-side image for every sheet,
-      // which is blank when the document is single-sided. Threshold: < 50 KB = blank.
+      // which is blank when the document is single-sided.
       if (pageData.length < BLANK_PAGE_THRESHOLD_BYTES) {
+        console.error(`[scan] Discarding page ${pageNum} as blank (${pageData.length} bytes < ${BLANK_PAGE_THRESHOLD_BYTES} threshold)`);
         fs.unlinkSync(pageFile);
         continue;
       }
@@ -1019,8 +1021,9 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 60000);
     let pdfResp;
+    const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1', rotate_pages: 'true' });
     try {
-      pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf`, {
+      pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${pdfParams}`, {
         method: 'POST',
         body: form,
         signal: ac.signal,
@@ -1895,6 +1898,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const params = new URLSearchParams({
         deskew: String(deskew),
         optimize: String(optimize),
+        rotate_pages: 'true',
       });
 
       const ac = new AbortController();
