@@ -1195,13 +1195,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "ocr_image_from_url",
       description:
-        "Download an image from a URL and extract text using polycr with Tesseract fallback. Enforces a 30s download timeout and a 20MB size limit. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.",
+        "Download an image from a URL and extract text using polycr with Tesseract fallback. Enforces a 30s download timeout and a 20MB size limit. Optionally pass auth_header to send an Authorization header (e.g., for fetching images from authenticated routes). Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.",
       inputSchema: {
         type: "object",
         properties: {
           url: {
             type: "string",
+            format: "uri",
             description: "URL of the image to download and OCR",
+          },
+          auth_header: {
+            type: "string",
+            description: "Optional Authorization header value (e.g., 'Bearer xyz')",
           },
         },
         required: ["url"],
@@ -1667,7 +1672,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   }
 
   if (name === "ocr_image_from_url") {
-    const { url } = args;
+    const { url, auth_header } = args;
 
     if (!url || typeof url !== "string") {
       throw new Error("url must be a non-empty string");
@@ -1678,7 +1683,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     let tempFile = null;
 
     try {
-      const resp = await fetch(url, { signal: ac.signal });
+      const headers = {};
+      if (auth_header && typeof auth_header === "string") {
+        headers["Authorization"] = auth_header;
+      }
+      const resp = await fetch(url, { signal: ac.signal, headers });
       clearTimeout(timer);
 
       if (!resp.ok) {
