@@ -1475,6 +1475,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["url"],
       },
     },
+    {
+      name: "detect_document_bbox",
+      description:
+        "Detect a receipt/document's bounding box in an image using polycr's /detect endpoint (PaddleOCR text-region convex hull, padded 8%). Returns axis-aligned bounding box with 4 corner points suitable for cropping. Useful for receipts-web auto-crop preview.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file_path: {
+            type: "string",
+            description: "Absolute path to the image file",
+          },
+        },
+        required: ["file_path"],
+      },
+    },
   ],
 }));
 
@@ -2835,6 +2850,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       };
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  if (name === "detect_document_bbox") {
+    const { file_path } = args;
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
+    }
+    if (!fs.existsSync(file_path)) {
+      throw new Error(`File not found: ${file_path}`);
+    }
+
+    try {
+      const form = new FormData();
+      form.append("file", fs.createReadStream(file_path));
+      const res = await fetch(`${POLYCR_URL}/detect`, { method: "POST", body: form });
+      if (!res.ok) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: `polycr /detect returned HTTP ${res.status}`,
+              corners: null,
+              bbox: null,
+            }),
+          }],
+          isError: true,
+        };
+      }
+      const data = await res.json();
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(data),
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            error: err && err.message ? err.message : String(err),
+            corners: null,
+            bbox: null,
+          }),
+        }],
+        isError: true,
+      };
     }
   }
 
