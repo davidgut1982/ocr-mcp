@@ -1479,7 +1479,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-  const { name, arguments: args } = request.params;
+  let { name, arguments: args } = request.params;
+
+  // Sanitize tool name — strip channel/template token leakage like "<|channel|>commentary"
+  const rawName = name;
+  const cleanName = rawName.replace(/<\|[^|]*\|>.*$/g, '').trim();
+  if (cleanName !== rawName) {
+    console.error(`[ocr-mcp] sanitized tool name: "${rawName}" -> "${cleanName}"`);
+  }
+  name = cleanName;
 
   // Why: Resets the MCP SDK client's 60s timeout window so long-running ADF scans
   //      are not cancelled mid-operation. Each notification extends the window.
