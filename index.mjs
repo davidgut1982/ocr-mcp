@@ -1440,6 +1440,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "fetch_url_as_base64",
+      description:
+        "Fetch a URL and return its body as base64. Supports optional Authorization header, HTTP method (default GET), and request body. Returns base64 string + content-type.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", format: "uri" },
+          auth_header: {
+            type: "string",
+            description: "Optional Authorization header value (e.g., 'Bearer xyz')",
+          },
+          method: {
+            type: "string",
+            enum: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+            default: "GET",
+          },
+          body: {
+            type: "string",
+            description: "Optional request body (will be sent as Content-Type: application/json)",
+          },
+          max_bytes: {
+            type: "integer",
+            default: 26214400,
+            description: "Maximum response size in bytes (default 25MB)",
+          },
+        },
+        required: ["url"],
+      },
+    },
   ],
 }));
 
@@ -2630,6 +2660,164 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       };
     } finally {
       try { fs.unlinkSync(tmpPdf); } catch (_) {}
+    }
+  }
+
+  if (name === "fetch_url_as_base64") {
+    // Why: Lets receipts-agent pull bytes from authenticated callbacks (e.g., receipts-web
+    //      /api/inbox/raw) without proliferating per-service tools. Returns base64 so the
+    //      payload survives JSON transport and can be fed straight to ocr_image_from_base64.
+    // What: Performs a single HTTP request with caller-controlled method/body/auth, enforces
+    //       a 30s timeout and a configurable max response size, and returns
+    //       { ok, status, content_type, size_bytes, base64 } or { ok:false, status?, error }.
+    // Test: Mock a 200 response; assert ok===true and base64 round-trips. Mock a 404; assert
+    //       ok===false and status===404. Mock an oversize body; assert ok===false with
+    //       error including "max_bytes".
+    const {
+      url,
+      auth_header,
+      method = "GET",
+      body,
+      max_bytes = 25 * 1024 * 1024,
+    } = args || {};
+
+    if (!url || typeof url !== "string") {
+      throw new Error("url must be a non-empty string");
+    }
+    const allowedMethods = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+    const httpMethod = String(method).toUpperCase();
+    if (!allowedMethods.includes(httpMethod)) {
+      throw new Error(`method must be one of ${allowedMethods.join(", ")}`);
+    }
+    const cap =
+      Number.isFinite(max_bytes) && max_bytes > 0
+        ? Math.floor(max_bytes)
+        : 25 * 1024 * 1024;
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 30000);
+
+    try {
+      const headers = {};
+      if (auth_header && typeof auth_header === "string") {
+        headers["Authorization"] = auth_header;
+      }
+      if (body !== undefined && body !== null) {
+        headers["Content-Type"] = "application/json";
+      }
+
+      let resp;
+      try {
+        resp = await fetch(url, {
+          method: httpMethod,
+          headers,
+          body:
+            body !== undefined && body !== null
+              ? typeof body === "string"
+                ? body
+                : JSON.stringify(body)
+              : undefined,
+          signal: ac.signal,
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                ok: false,
+                error: `fetch failed: ${err && err.message ? err.message : String(err)}`,
+              }),
+            },
+          ],
+        };
+      }
+
+      const contentType = resp.headers.get("content-type") || "";
+
+      if (!resp.ok) {
+        // Drain (best-effort) so the connection can be released cleanly.
+        try {
+          await resp.arrayBuffer();
+        } catch (_) {}
+        clearTimeout(timer);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                ok: false,
+                status: resp.status,
+                content_type: contentType,
+                error: `HTTP ${resp.status}`,
+              }),
+            },
+          ],
+        };
+      }
+
+      const chunks = [];
+      let totalBytes = 0;
+      let exceeded = false;
+      try {
+        for await (const chunk of resp.body) {
+          totalBytes += chunk.length;
+          if (totalBytes > cap) {
+            exceeded = true;
+            break;
+          }
+          chunks.push(chunk);
+        }
+      } catch (err) {
+        clearTimeout(timer);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                ok: false,
+                status: resp.status,
+                error: `read failed: ${err && err.message ? err.message : String(err)}`,
+              }),
+            },
+          ],
+        };
+      }
+      clearTimeout(timer);
+
+      if (exceeded) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                ok: false,
+                status: resp.status,
+                error: `response exceeds max_bytes (${cap})`,
+              }),
+            },
+          ],
+        };
+      }
+
+      const buf = Buffer.concat(chunks);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              ok: true,
+              status: resp.status,
+              content_type: contentType,
+              size_bytes: buf.length,
+              base64: buf.toString("base64"),
+            }),
+          },
+        ],
+      };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
