@@ -14,7 +14,7 @@ import os from "os";
 
 const execFileAsync = promisify(execFile);
 
-const POLYCR_HOST = process.env.POLYCR_HOST || '192.168.1.11';
+const POLYCR_HOST = process.env.POLYCR_HOST || '192.168.1.30';
 const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
 const POLYCR_PDF_URL = `http://${POLYCR_HOST}:8001`;
 const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
