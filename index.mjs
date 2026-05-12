@@ -16,7 +16,7 @@ const execFileAsync = promisify(execFile);
 
 const POLYCR_HOST = process.env.POLYCR_HOST || '192.168.1.30';
 const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
-const POLYCR_PDF_URL = `http://${POLYCR_HOST}:8001`;
+const POLYCR_PDF_URL = process.env.POLYCR_PDF_URL || `http://${new URL(POLYCR_URL).hostname}:8001`;
 const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
 
 const SCANNERS = {
@@ -75,10 +75,11 @@ function countWords(text) {
 // Why: Provides a local Tesseract fallback when the polycr service is unavailable.
 // What: Runs tesseract twice (text + TSV for confidence), returns text, confidence, word_count, empty.
 // Test: Call with a known image, assert text is non-empty and confidence is a number between 0 and 1.
-async function runLocalTesseract(filePath) {
+async function runLocalTesseract(filePath, language) {
+  const lang = language || "eng";
   const [textResult, tsvResult] = await Promise.all([
-    execFileAsync("tesseract", [filePath, "stdout", "-l", "eng"]),
-    execFileAsync("tesseract", [filePath, "stdout", "-l", "eng", "tsv"]),
+    execFileAsync("tesseract", [filePath, "stdout", "-l", lang]),
+    execFileAsync("tesseract", [filePath, "stdout", "-l", lang, "tsv"]),
   ]);
   const text = textResult.stdout;
   const lines = tsvResult.stdout.split("\n").slice(1);
@@ -101,7 +102,7 @@ async function runLocalTesseract(filePath) {
 // Why: Sends an image to the polycr multi-engine OCR service with a timeout guard.
 // What: POSTs multipart/form-data to POLYCR_URL/ocr/raw with a 30s AbortController timeout.
 // Test: Mock fetch to return a valid engine response; assert result is non-null and fallback_reason is null.
-async function callPolycr(filePath) {
+async function callPolycr(filePath, language) {
   const fileBytes = fs.readFileSync(filePath);
   const ext = path.extname(filePath).slice(1).toLowerCase() || "jpg";
   const mimeMap = {
@@ -114,32 +115,56 @@ async function callPolycr(filePath) {
     bmp: "image/bmp",
   };
   const mime = mimeMap[ext] || "application/octet-stream";
-  const blob = new Blob([fileBytes], { type: mime });
-  const form = new FormData();
-  form.append("file", blob, path.basename(filePath));
-  const ac = new AbortController();
-  // 30s timeout
-  const timer = setTimeout(() => ac.abort(), 30000);
-  try {
-    const resp = await fetch(`${POLYCR_URL}/ocr/raw`, {
-      method: "POST",
-      body: form,
-      signal: ac.signal,
-    });
-    clearTimeout(timer);
-    if (!resp.ok)
-      return { result: null, fallback_reason: `polycr HTTP ${resp.status}` };
-    const data = await resp.json();
-    return { result: data, fallback_reason: null };
-  } catch (err) {
-    clearTimeout(timer);
-    const isTimeout = err.name === "AbortError";
-    return {
-      result: null,
-      fallback_reason: isTimeout
-        ? "polycr timeout (30s)"
-        : `polycr unreachable: ${err.message}`,
-    };
+  const lang = language || "eng";
+
+  const MAX_ATTEMPTS = 2;
+  const COLD_START_DELAY_MS = 10_000;
+  let lastErr;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const blob = new Blob([fileBytes], { type: mime });
+    const form = new FormData();
+    form.append("file", blob, path.basename(filePath));
+    form.append("language", lang);
+    const ac = new AbortController();
+    // 90s timeout — PaddleOCR cold-start after container recreation can take 50-60s
+    const timer = setTimeout(() => ac.abort(), 90000);
+    try {
+      const resp = await fetch(`${POLYCR_URL}/ocr/raw`, {
+        method: "POST",
+        body: form,
+        signal: ac.signal,
+      });
+      clearTimeout(timer);
+      if (!resp.ok)
+        return { result: null, fallback_reason: `polycr HTTP ${resp.status}` };
+      const data = await resp.json();
+      return { result: data, fallback_reason: null };
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+      const isRetryable =
+        err?.name === "AbortError" ||
+        err?.code === "ECONNREFUSED" ||
+        err?.code === "ETIMEDOUT" ||
+        err?.cause?.code === "ECONNREFUSED" ||
+        err?.cause?.code === "ETIMEDOUT" ||
+        /fetch failed/i.test(String(err?.message ?? err));
+      if (attempt < MAX_ATTEMPTS && isRetryable) {
+        console.error(
+          `[polycr] attempt ${attempt} failed (${err?.message ?? err}); retrying after ${COLD_START_DELAY_MS}ms (cold-start)`
+        );
+        await new Promise((r) => setTimeout(r, COLD_START_DELAY_MS));
+        continue;
+      }
+      const isTimeout = err.name === "AbortError";
+      return {
+        result: null,
+        fallback_reason: isTimeout
+          ? "polycr timeout (90s)"
+          : `polycr unreachable: ${err.message}`,
+      };
+    }
   }
 }
 
@@ -266,8 +291,8 @@ async function reconcileOcrWithLLM(engineResults) {
 //       assert engine_used is 'llm-reconciled' and text is "reconciled".
 //       Mock reconcileOcrWithLLM to return null; assert engine_used is the consensus engine name.
 //       Mock callPolycr to return null result; assert engine_used is 'tesseract-local'.
-async function ocrWithFallback(filePath) {
-  const { result, fallback_reason } = await callPolycr(filePath);
+async function ocrWithFallback(filePath, language) {
+  const { result, fallback_reason } = await callPolycr(filePath, language);
   if (result) {
     // Collect all engine results that produced usable text
     const engineResults = (result.results || [])
@@ -306,7 +331,7 @@ async function ocrWithFallback(filePath) {
     }
   }
   console.error(`ocrWithFallback: polycr unavailable (${fallback_reason || 'no result'}), falling back to local Tesseract`);
-  const local = await runLocalTesseract(filePath);
+  const local = await runLocalTesseract(filePath, language);
   return {
     text: local.text,
     engine_used: "tesseract-local",
@@ -1010,7 +1035,8 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution, onProgress) {
 // Test: Mock fetch to return a valid PDF buffer; assert method === "polycr".
 //       Mock fetch to throw; mock CLI to succeed; assert method === "ocrmypdf-local".
 //       Mock all three to fail; assert the function throws.
-async function createSearchablePdfFromJpeg(jpegPath, outPath) {
+async function createSearchablePdfFromJpeg(jpegPath, outPath, language) {
+  const lang = language || "eng";
   // Attempt 1: remote polycr ocrmypdf service at port 8001
   // rotate-pages, deskew, and image-dpi 300 are applied server-side
   try {
@@ -1021,7 +1047,7 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 60000);
     let pdfResp;
-    const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1', rotate_pages: 'true' });
+    const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1', rotate_pages: 'true', language: lang });
     try {
       pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${pdfParams}`, {
         method: 'POST',
@@ -1046,13 +1072,13 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath) {
   } catch (remoteErr) {
     // Attempt 2: local ocrmypdf CLI
     try {
-      await execFileAsync('ocrmypdf', ['--rotate-pages', '--deskew', '--optimize', '1', '--image-dpi', '300', jpegPath, outPath]);
+      await execFileAsync('ocrmypdf', ['--rotate-pages', '--deskew', '--optimize', '1', '--image-dpi', '300', '--language', lang, jpegPath, outPath]);
       return { path: outPath, method: 'ocrmypdf-local' };
     } catch (cliErr) {
       // Attempt 3: bare tesseract pdf mode as last resort
       try {
         const outStem = outPath.replace(/\.pdf$/, '');
-        await execFileAsync('tesseract', [jpegPath, outStem, 'pdf']);
+        await execFileAsync('tesseract', [jpegPath, outStem, '-l', lang, 'pdf']);
         return { path: outPath, method: 'tesseract-local' };
       } catch (tesseractErr) {
         throw new Error(
@@ -1366,6 +1392,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             enum: ["hp-officejet-5740", "canon-mf741c"],
             description: "Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). hp-officejet-5740 = HP Officejet 5740 (backup flatbed). Default: canon-mf741c",
+          },
+          language: {
+            type: "string",
+            enum: ["eng", "lav"],
+            description: "OCR language for text recognition. 'eng' = English (default), 'lav' = Latvian. Threads through to Tesseract and ocrmypdf.",
           },
         },
         required: ["profile"],
@@ -1702,8 +1733,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
 
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 30000);
+    // 60s download timeout — keeps room in the 60s MCP SDK window before OCR starts
+    const timer = setTimeout(() => ac.abort(), 60000);
     let tempFile = null;
+    // Send a progress ping every 20s so the MCP SDK client resets its 60s timeout window
+    const pingInterval = setInterval(() => sendProgress(1, -1, 'ocr_image_from_url: working…'), 20000);
 
     try {
       const headers = {};
@@ -1768,6 +1802,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       clearTimeout(timer);
       throw err;
     } finally {
+      clearInterval(pingInterval);
       if (tempFile && fs.existsSync(tempFile)) {
         fs.unlinkSync(tempFile);
       }
@@ -2032,7 +2067,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const resolvedArgs = name === "quick_scan"
       ? { profile: 'doc-bw-adf', scanner: 'canon-mf741c', ...(args.description ? { description: args.description } : {}) }
       : args;
-    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride, separate_pages = false, scanner = 'canon-mf741c' } = resolvedArgs;
+    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride, separate_pages = false, scanner = 'canon-mf741c', language } = resolvedArgs;
     const deviceName = SCANNERS[scanner] || DEFAULT_SCANNER;
     const params = PROFILE_PARAMS[profile];
     if (!params) throw new Error(`Unknown profile: ${profile}`);
@@ -2070,7 +2105,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       let ocrFallbackReason = null;
 
       if (profile !== 'photo') {
-        const ocrResult = await ocrWithFallback(tmpJpeg);
+        const ocrResult = await ocrWithFallback(tmpJpeg, language);
         ocrText = ocrResult.text || '';
         wordCount = ocrResult.word_count || 0;
         confidence = ocrResult.confidence || 0;
@@ -2083,7 +2118,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           allTempFiles.push(enhanced);
           try {
             execSync(`convert ${JSON.stringify(tmpJpeg)} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
-            const enhancedResult = await ocrWithFallback(enhanced);
+            const enhancedResult = await ocrWithFallback(enhanced, language);
             if ((enhancedResult.word_count || 0) > wordCount) {
               ocrText = enhancedResult.text || '';
               wordCount = enhancedResult.word_count || 0;
@@ -2123,7 +2158,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       let fileToUpload = tmpJpeg;
       let pdfMethod = 'jpeg-only';
       if (profile !== 'photo' && profile !== 'event') {
-        const pdfResult = await createSearchablePdfFromJpeg(tmpJpeg, tmpPdf);
+        const pdfResult = await createSearchablePdfFromJpeg(tmpJpeg, tmpPdf, language);
         fileToUpload = pdfResult.path;
         pdfMethod = pdfResult.method;
       }
@@ -2231,7 +2266,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         let ocrFallbackReason = null;
 
         if (profile !== 'photo') {
-          const ocrResult = await ocrWithFallback(pageJpegs[0]);
+          const ocrResult = await ocrWithFallback(pageJpegs[0], language);
           ocrText = ocrResult.text || '';
           wordCount = ocrResult.word_count || 0;
           confidence = ocrResult.confidence || 0;
@@ -2244,7 +2279,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             allTempFiles.push(enhanced);
             try {
               execSync(`convert ${JSON.stringify(pageJpegs[0])} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
-              const enhancedResult = await ocrWithFallback(enhanced);
+              const enhancedResult = await ocrWithFallback(enhanced, language);
               if ((enhancedResult.word_count || 0) > wordCount) {
                 ocrText = enhancedResult.text || '';
                 wordCount = enhancedResult.word_count || 0;
@@ -2279,7 +2314,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
           if (pageJpegs.length === 1) {
             // Single page — no ImageMagick merge needed, process JPEG directly
-            const pdfResult = await createSearchablePdfFromJpeg(pageJpegs[0], mergedPdf);
+            const pdfResult = await createSearchablePdfFromJpeg(pageJpegs[0], mergedPdf, language);
             fileToUpload = pdfResult.path;
             pdfMethod = pdfResult.method;
           } else {
@@ -2297,7 +2332,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
               const blob = new Blob([fileBytes], { type: 'application/pdf' });
               const form = new FormData();
               form.append('file', blob, 'merged.pdf');
-              const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1', rotate_pages: 'true' });
+              const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1', rotate_pages: 'true', language: language || 'eng' });
               const ac = new AbortController();
               const timer = setTimeout(() => ac.abort(), 120000);
               let pdfResp;
@@ -2324,7 +2359,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             } catch (_remoteErr) {
               // Fallback: ocrmypdf CLI on the already-merged PDF
               try {
-                await execFileAsync('ocrmypdf', ['--rotate-pages', '--deskew', '--optimize', '1', '--image-dpi', '300', mergedPdf, ocrPdf]);
+                await execFileAsync('ocrmypdf', ['--rotate-pages', '--deskew', '--optimize', '1', '--image-dpi', '300', '--language', language || 'eng', mergedPdf, ocrPdf]);
                 fileToUpload = ocrPdf;
                 pdfMethod = 'ocrmypdf-local';
               } catch (_cliErr) {
