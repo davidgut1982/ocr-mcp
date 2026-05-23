@@ -1,7 +1,7 @@
 # Scanning Profiles Reference
 
-Scanner: HP OfficeJet 5740 at `escl:http://192.168.1.183:8080`  
-Nextcloud WebDAV base: `https://nextcloud.shifting-ground.link/remote.php/dav/files/david.gutowsky`  
+Scanner: HP OfficeJet 5740 at `escl:http://192.168.1.183:8080`
+Nextcloud WebDAV base: `https://nextcloud.shifting-ground.link/remote.php/dav/files/david.gutowsky`
 Credentials: from `openclaw.json` → `mcp.servers.nextcloud-files.env`
 
 ## All Profiles
@@ -31,7 +31,7 @@ Credentials: from `openclaw.json` → `mcp.servers.nextcloud-files.env`
 
 **Extract from text:** date, sender/issuer, document type, subject
 
-**Filename format:** `YYYY-MM-DD_issuer-description.pdf`  
+**Filename format:** `YYYY-MM-DD_issuer-description.pdf`
 Example: `2026-04-13_verizon-bill.pdf`
 
 **Date rule:** use date found in document; fall back to today's date if none found
@@ -94,7 +94,7 @@ Example: `2026-04-13_verizon-bill.pdf`
 
 **Extract:** merchant name, date, total amount
 
-**Filename format:** `YYYY-MM-DD_receipt-merchant.pdf`  
+**Filename format:** `YYYY-MM-DD_receipt-merchant.pdf`
 Example: `2026-03-15_receipt-home-depot.pdf`
 
 **Filing:** always `/Personal/Financial/Receipts/` — no classification needed
@@ -114,7 +114,7 @@ Example: `2026-03-15_receipt-home-depot.pdf`
 
 **Extract:** ID type, name on card, expiry date
 
-**Filename format:** `YYYY-MM-DD_id-type-name.pdf`  
+**Filename format:** `YYYY-MM-DD_id-type-name.pdf`
 Example: `2026-04-13_insurance-card-david-gutowsky.pdf`
 
 **Filing rules:**

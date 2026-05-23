@@ -1,9 +1,8 @@
-import { execSync } from 'child_process';
-import { execFile } from 'child_process';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
-import { promisify } from 'util';
+import { execFile, execSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -13,7 +12,6 @@ const execFileAsync = promisify(execFile);
 const POLYCR_HOST = process.env.POLYCR_HOST || '192.168.1.30';
 const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
 const POLYCR_PDF_URL = process.env.POLYCR_PDF_URL || `http://${new URL(POLYCR_URL).hostname}:8001`;
-const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
 
 const SCANNERS = {
   'hp-officejet-5740': process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080',
@@ -46,11 +44,6 @@ const BLANK_PAGE_THRESHOLD_BYTES = 100_000;
 const LITELLM_URL = process.env.LITELLM_URL || 'http://192.168.1.19:4000/v1/chat/completions';
 const LITELLM_KEY = process.env.LITELLM_KEY || 'sk-litellm-openclaw';
 const LITELLM_MODEL = process.env.LITELLM_MODEL || 'auto';
-
-// Why: Provides a promisified sleep for async retry loops and rate-limit backoff.
-// What: Returns a Promise that resolves after `ms` milliseconds.
-// Test: Assert `await delay(50)` completes without error and takes ~50ms.
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Helper: derive default output path from input path
 function defaultOutputPath(filePath) {
@@ -116,7 +109,7 @@ async function callPolycr(filePath, language) {
 
   const MAX_ATTEMPTS = 2;
   const COLD_START_DELAY_MS = 10_000;
-  let lastErr;
+  let _lastErr;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const blob = new Blob([fileBytes], { type: mime });
@@ -138,7 +131,7 @@ async function callPolycr(filePath, language) {
       return { result: data, fallback_reason: null };
     } catch (err) {
       clearTimeout(timer);
-      lastErr = err;
+      _lastErr = err;
       const isRetryable =
         err?.name === 'AbortError' ||
         err?.code === 'ECONNREFUSED' ||
@@ -403,7 +396,7 @@ const PROFILE_PARAMS = {
 // Test: Call with profile='receipt', assert path === '/Personal/Financial/Receipts/'.
 //       Call with text containing "prescription", assert type === 'medical'.
 function classifyDocumentForFiling(text, profile, description) {
-  const lower = (text + ' ' + (description || '')).toLowerCase();
+  const lower = `${text} ${description || ''}`.toLowerCase();
 
   if (profile === 'receipt') return { type: 'receipt', path: '/Personal/Financial/Receipts/' };
   if (profile === 'photo') return { type: 'photo', path: '/Media/Photos/' };
@@ -444,7 +437,7 @@ function classifyDocumentForFiling(text, profile, description) {
         const yearMatch = text.match(/\b(20\d{2})\b/g);
         const currentYear = new Date().getFullYear();
         const years = (yearMatch || [])
-          .map((y) => Number.parseInt(y))
+          .map((y) => Number.parseInt(y, 10))
           .filter((y) => y >= 2000 && y <= currentYear + 1);
         const year = years.length > 0 ? Math.max(...years) : currentYear;
         rulePath = rulePath.replace('{year}', year);
@@ -509,7 +502,7 @@ function classifyDocumentForFiling(text, profile, description) {
 // Test: Call with text containing "Invoice Date: November 7, 2025" from "DeCraenes Service
 //       Center"; assert result is { date: '2025-11-07', slug: 'DeCraenes_Service_Center_Invoice' }.
 async function generateFilenamePartsWithLLM(ocrText, classification) {
-  const today = new Date().toISOString().split('T')[0];
+  const _today = new Date().toISOString().split('T')[0];
   const snippet = ocrText.slice(0, 1200);
   const prompt =
     `You are a document filing assistant. Extract the document date and generate a filename slug.\n\n` +
@@ -666,8 +659,8 @@ async function generateFilename(text, classification, description, ext) {
   };
 
   let dateStr = null;
-  const m1 = text.match(/\b(\d{4})[\/\-](\d{2})[\/\-](\d{2})\b/);
-  const m2 = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
+  const m1 = text.match(/\b(\d{4})[/-](\d{2})[/-](\d{2})\b/);
+  const m2 = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/);
   const m3 = text.match(
     /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})\b/i
   );
@@ -677,7 +670,7 @@ async function generateFilename(text, classification, description, ext) {
   const m3c = text.match(
     /\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{4})\b/i
   );
-  const m2b = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})\b/);
+  const m2b = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{2})\b/);
 
   // m1: ISO-style YYYY-MM-DD — validate year, month, day ranges
   if (m1) {
@@ -1197,7 +1190,7 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath, language) {
 async function nextcloudUpload(localPath, nextcloudPath, filename) {
   const fileBuffer = fs.readFileSync(localPath);
   const url = `${NEXTCLOUD_WEBDAV_BASE}${nextcloudPath}${encodeURIComponent(filename)}`;
-  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
+  const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
 
   // MKCOL is safe to call even when directory already exists (server returns 405).
   await fetch(`${NEXTCLOUD_WEBDAV_BASE}${nextcloudPath}`, {
@@ -1220,7 +1213,7 @@ async function nextcloudUpload(localPath, nextcloudPath, filename) {
 // What: HTTP GET via WebDAV, writes buffer to outputPath.
 async function nextcloudDownload(ncFullPath, outputPath) {
   const url = `${NEXTCLOUD_WEBDAV_BASE}${ncFullPath}`;
-  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
+  const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
   const resp = await fetch(url, { method: 'GET', headers: { Authorization: auth } });
   if (!resp.ok) throw new Error(`Nextcloud download failed: HTTP ${resp.status} for ${ncFullPath}`);
   fs.writeFileSync(outputPath, Buffer.from(await resp.arrayBuffer()));
@@ -1230,7 +1223,7 @@ async function nextcloudDownload(ncFullPath, outputPath) {
 // What: WebDAV DELETE — returns true on success, throws on unexpected error.
 async function nextcloudDelete(ncFullPath) {
   const url = `${NEXTCLOUD_WEBDAV_BASE}${ncFullPath}`;
-  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
+  const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
   const resp = await fetch(url, { method: 'DELETE', headers: { Authorization: auth } });
   if (!resp.ok && resp.status !== 204 && resp.status !== 404) {
     throw new Error(`Nextcloud DELETE failed: HTTP ${resp.status}`);
@@ -1842,7 +1835,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
       const headers = {};
       if (auth_header && typeof auth_header === 'string') {
-        headers['Authorization'] = auth_header;
+        headers.Authorization = auth_header;
       }
       const resp = await fetch(url, { signal: ac.signal, headers });
       clearTimeout(timer);
@@ -2213,7 +2206,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
      *       and returns the flat result object.
      * Test: Pass a known JPEG path with mocked ocrWithFallback; assert result.success.
      */
-    async function processSinglePage(tmpJpeg, tmpPdf, pageLabel) {
+    async function processSinglePage(tmpJpeg, tmpPdf, _pageLabel) {
       // Step 2: OCR (skip for photo profile)
       let ocrText = '';
       let wordCount = 0;
@@ -2595,8 +2588,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
   if (name === 'nextcloud_move') {
     const { source_path, dest_path } = args;
-    const auth =
-      'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
+    const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
     const sourceUrl = `${NEXTCLOUD_WEBDAV_BASE}${source_path}`;
     const destUrl = `${NEXTCLOUD_WEBDAV_BASE}${dest_path}`;
 
@@ -2991,7 +2983,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
       const headers = {};
       if (auth_header && typeof auth_header === 'string') {
-        headers['Authorization'] = auth_header;
+        headers.Authorization = auth_header;
       }
       if (body !== undefined && body !== null) {
         headers['Content-Type'] = 'application/json';
@@ -3018,7 +3010,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
               type: 'text',
               text: JSON.stringify({
                 ok: false,
-                error: `fetch failed: ${err && err.message ? err.message : String(err)}`,
+                error: `fetch failed: ${err?.message ? err.message : String(err)}`,
               }),
             },
           ],
@@ -3069,7 +3061,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
               text: JSON.stringify({
                 ok: false,
                 status: resp.status,
-                error: `read failed: ${err && err.message ? err.message : String(err)}`,
+                error: `read failed: ${err?.message ? err.message : String(err)}`,
               }),
             },
           ],
@@ -3155,7 +3147,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           {
             type: 'text',
             text: JSON.stringify({
-              error: err && err.message ? err.message : String(err),
+              error: err?.message ? err.message : String(err),
               corners: null,
               bbox: null,
             }),
