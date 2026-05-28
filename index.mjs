@@ -1290,21 +1290,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'ocr_image_from_base64',
       description:
-        'Decode a base64-encoded image and extract text using polycr with Tesseract fallback. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.',
+        'Read a local image file, base64-encode it internally, and extract text using polycr with Tesseract fallback. Pass a local filesystem path (NOT raw base64) — the tool handles encoding so large image payloads never pass through the LLM. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.',
       inputSchema: {
         type: 'object',
         properties: {
-          base64_data: {
+          file_path: {
             type: 'string',
-            description: 'Base64-encoded image data',
-          },
-          mime_type: {
-            type: 'string',
-            description:
-              'MIME type of the image (image/jpeg, image/png, image/gif, image/webp, image/tiff, image/bmp)',
+            description: 'Absolute path to the local image file (jpg, png, gif, webp, tiff, bmp)',
           },
         },
-        required: ['base64_data', 'mime_type'],
+        required: ['file_path'],
       },
     },
     {
@@ -1435,6 +1430,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Absolute path to the input image or PDF file',
           },
+          output_path: {
+            type: 'string',
+            description: 'Absolute path for the output PDF. If omitted, defaults to <input-basename>.pdf in the input\'s directory.',
+          },
           deskew: {
             type: 'boolean',
             description: 'Deskew the input before OCR (default true)',
@@ -1442,6 +1441,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           optimize: {
             type: 'number',
             description: 'PDF optimization level 0–3 (default 1)',
+          },
+          image_dpi: {
+            type: 'integer',
+            description: 'DPI to assume for image inputs lacking embedded resolution metadata (default 300). Always forwarded to ocrmypdf for image inputs so stock JPEGs without DPI work out of the box.',
           },
         },
         required: ['image_path'],
@@ -1512,7 +1515,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'nextcloud_move',
       description:
-        'Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning. source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/123-Sample-Dr/Mortage/old.pdf). Returns success and the new full URL.',
+        'Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning, or to move a file into a different directory — cross-directory moves are fully supported (verified working in testing). source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/123-Sample-Dr/Mortage/old.pdf). Returns success and the new full URL.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1524,7 +1527,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           dest_path: {
             type: 'string',
             description:
-              'New full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_rocket-mortgage.pdf). Must be in the same folder for a rename.',
+              'New full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_rocket-mortgage.pdf). May be in a different folder than source_path — cross-directory moves are fully supported.',
           },
         },
         required: ['source_path', 'dest_path'],
@@ -1765,31 +1768,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   }
 
   if (name === 'ocr_image_from_base64') {
-    const { base64_data, mime_type } = args;
-    const mimeStr = typeof mime_type === 'string' ? mime_type : String(mime_type ?? '');
-    const b64Str = typeof base64_data === 'string' ? base64_data : String(base64_data ?? '');
+    // Why: The LLM must not emit raw base64 — large image strings overflow the output
+    //      token limit and corrupt the tool-call args, crashing the hermes gateway.
+    //      Accepting a file path keeps the LLM interaction small while still exercising
+    //      the base64 encode path (the file is read and encoded internally here).
+    // What: Reads file_path, base64-encodes it, decodes back to a temp file, then OCRs.
+    // Test: Call with a known JPEG path; assert returned text is non-empty and the temp
+    //       file is removed afterward.
+    const { file_path } = args;
 
-    const allowedMimes = [
-      'image/jpeg',
-      'image/png',
-      'image/gif',
-      'image/webp',
-      'image/tiff',
-      'image/bmp',
-    ];
-    if (!allowedMimes.includes(mimeStr)) {
-      throw new Error(`Invalid mime_type. Must be one of: ${allowedMimes.join(', ')}`);
+    if (!file_path || typeof file_path !== 'string') {
+      throw new Error('file_path must be a non-empty string');
+    }
+    if (!fs.existsSync(file_path)) {
+      throw new Error(`File not found: ${file_path}`);
     }
 
-    const extMap = {
-      'image/jpeg': '.jpg',
-      'image/png': '.png',
-      'image/gif': '.gif',
-      'image/webp': '.webp',
-      'image/tiff': '.tiff',
-      'image/bmp': '.bmp',
+    const allowedExts = {
+      '.jpg': '.jpg',
+      '.jpeg': '.jpg',
+      '.png': '.png',
+      '.gif': '.gif',
+      '.webp': '.webp',
+      '.tiff': '.tiff',
+      '.tif': '.tiff',
+      '.bmp': '.bmp',
     };
-    const ext = extMap[mimeStr];
+    const inExt = path.extname(file_path).toLowerCase();
+    const ext = allowedExts[inExt];
+    if (!ext) {
+      throw new Error(
+        `Unsupported image extension '${inExt}'. Must be one of: ${[...new Set(Object.keys(allowedExts))].join(', ')}`
+      );
+    }
+
+    // Encode to base64 internally, then decode to a temp file — keeps the base64 code
+    // path exercised without ever routing the raw string through the LLM.
+    const b64Str = fs.readFileSync(file_path).toString('base64');
     const tempFile = path.join(os.tmpdir(), `ocr_b64_${Date.now()}${ext}`);
 
     try {
@@ -2052,7 +2067,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     //       Falls back to `tesseract <input> <stem> pdf` if the service is unreachable.
     // Test: Mock fetch to return a PDF buffer; assert pdf_path ends in .pdf and size_bytes > 0.
     //       Mock fetch to throw; assert fallback_reason is set and pdf_path still exists.
-    const { image_path, deskew = true, optimize = 1 } = args;
+    const { image_path, output_path, deskew = true, optimize = 1, image_dpi = 300 } = args;
 
     if (!image_path || typeof image_path !== 'string') {
       throw new Error('image_path must be a non-empty string');
@@ -2063,12 +2078,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
     const dir = path.dirname(image_path);
     const stem = path.basename(image_path, path.extname(image_path));
-    const pdfPath = path.join(dir, `${stem}.pdf`);
+    // Honor the caller-supplied output_path; only derive a default from the input
+    // basename when none is provided. (Bug: output_path was previously ignored.)
+    const pdfPath = (output_path && typeof output_path === 'string')
+      ? output_path
+      : path.join(dir, `${stem}.pdf`);
+
+    const ext = path.extname(image_path).slice(1).toLowerCase() || 'jpg';
+    // Image inputs lack DPI metadata when created without -density; ocrmypdf requires
+    // an explicit --image-dpi for those. PDFs carry their own resolution, so DPI only
+    // applies to non-PDF (image) inputs.
+    const isImageInput = ext !== 'pdf';
 
     // Attempt remote ocrmypdf service first
     try {
       const fileBytes = fs.readFileSync(image_path);
-      const ext = path.extname(image_path).slice(1).toLowerCase() || 'jpg';
       const mimeMap = {
         jpg: 'image/jpeg',
         jpeg: 'image/jpeg',
@@ -2088,6 +2112,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         deskew: String(deskew),
         optimize: String(optimize),
         rotate_pages: 'true',
+        ...(isImageInput ? { image_dpi: String(image_dpi) } : {}),
       });
 
       const ac = new AbortController();
@@ -2588,9 +2613,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
   if (name === 'nextcloud_move') {
     const { source_path, dest_path } = args;
+
+    // Pre-validate identical paths: Nextcloud otherwise returns an opaque HTTP 403
+    // ("Source and destination uri are identical"). Catch it here with a clear message.
+    if (source_path.trim() === dest_path.trim()) {
+      return {
+        content: [{ type: 'text', text: 'Source and destination paths are identical — no move needed.' }],
+      };
+    }
+
+    // Encode each path segment so filenames containing & ? # % do not corrupt the
+    // WebDAV URL, while preserving the / directory separators.
+    const encodePath = (p) => p.split('/').map(encodeURIComponent).join('/');
+
     const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
-    const sourceUrl = `${NEXTCLOUD_WEBDAV_BASE}${source_path}`;
-    const destUrl = `${NEXTCLOUD_WEBDAV_BASE}${dest_path}`;
+    const sourceUrl = `${NEXTCLOUD_WEBDAV_BASE}${encodePath(source_path)}`;
+    const destUrl = `${NEXTCLOUD_WEBDAV_BASE}${encodePath(dest_path)}`;
 
     const resp = await fetch(sourceUrl, {
       method: 'MOVE',
