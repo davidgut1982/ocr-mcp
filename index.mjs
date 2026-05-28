@@ -49,7 +49,7 @@ const BLANK_PAGE_THRESHOLD_BYTES = 200_000;
 // LiteLLM proxy — OpenAI-compatible endpoint on the local network.
 // Used for LLM-based OCR reconciliation: all engine outputs are fed to the
 // LLM and it returns the best possible merged transcription.
-const LITELLM_URL = process.env.LITELLM_URL || 'http://192.168.1.19:4000/v1/chat/completions';
+const LITELLM_URL = process.env.LITELLM_URL || 'http://192.168.1.23:4000/v1/chat/completions';
 const LITELLM_KEY = process.env.LITELLM_KEY || 'sk-litellm-openclaw';
 const LITELLM_MODEL = process.env.LITELLM_MODEL || 'auto';
 
