@@ -1201,21 +1201,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "ocr_image_from_base64",
       description:
-        "Decode a base64-encoded image and extract text using polycr with Tesseract fallback. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.",
+        "Read a local image file, base64-encode it internally, and extract text using polycr with Tesseract fallback. Pass a local filesystem path (NOT raw base64) — the tool handles encoding so large image payloads never pass through the LLM. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.",
       inputSchema: {
         type: "object",
         properties: {
-          base64_data: {
+          file_path: {
             type: "string",
-            description: "Base64-encoded image data",
-          },
-          mime_type: {
-            type: "string",
-            description:
-              "MIME type of the image (image/jpeg, image/png, image/gif, image/webp, image/tiff, image/bmp)",
+            description: "Absolute path to the local image file (jpg, png, gif, webp, tiff, bmp)",
           },
         },
-        required: ["base64_data", "mime_type"],
+        required: ["file_path"],
       },
     },
     {
@@ -1348,6 +1343,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "Absolute path to the input image or PDF file",
           },
+          output_path: {
+            type: "string",
+            description: "Absolute path for the output PDF. If omitted, defaults to <input-basename>.pdf in the input's directory.",
+          },
           deskew: {
             type: "boolean",
             description: "Deskew the input before OCR (default true)",
@@ -1355,6 +1354,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           optimize: {
             type: "number",
             description: "PDF optimization level 0–3 (default 1)",
+          },
+          image_dpi: {
+            type: "integer",
+            description: "DPI to assume for image inputs lacking embedded resolution metadata (default 300). Always forwarded to ocrmypdf for image inputs so stock JPEGs without DPI work out of the box.",
           },
         },
         required: ["image_path"],
@@ -1673,33 +1676,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   }
 
   if (name === "ocr_image_from_base64") {
-    const { base64_data, mime_type } = args;
-    const mimeStr = typeof mime_type === 'string' ? mime_type : String(mime_type ?? '');
-    const b64Str = typeof base64_data === 'string' ? base64_data : String(base64_data ?? '');
+    // Why: The LLM must not emit raw base64 — large image strings overflow the output
+    //      token limit and corrupt the tool-call args, crashing the hermes gateway.
+    //      Accepting a file path keeps the LLM interaction small while still exercising
+    //      the base64 encode path (the file is read and encoded internally here).
+    // What: Reads file_path, base64-encodes it, decodes back to a temp file, then OCRs.
+    // Test: Call with a known JPEG path; assert returned text is non-empty and the temp
+    //       file is removed afterward.
+    const { file_path } = args;
 
-    const allowedMimes = [
-      "image/jpeg",
-      "image/png",
-      "image/gif",
-      "image/webp",
-      "image/tiff",
-      "image/bmp",
-    ];
-    if (!allowedMimes.includes(mimeStr)) {
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
+    }
+    if (!fs.existsSync(file_path)) {
+      throw new Error(`File not found: ${file_path}`);
+    }
+
+    const allowedExts = {
+      ".jpg": ".jpg",
+      ".jpeg": ".jpg",
+      ".png": ".png",
+      ".gif": ".gif",
+      ".webp": ".webp",
+      ".tiff": ".tiff",
+      ".tif": ".tiff",
+      ".bmp": ".bmp",
+    };
+    const inExt = path.extname(file_path).toLowerCase();
+    const ext = allowedExts[inExt];
+    if (!ext) {
       throw new Error(
-        `Invalid mime_type. Must be one of: ${allowedMimes.join(", ")}`
+        `Unsupported image extension '${inExt}'. Must be one of: ${[...new Set(Object.keys(allowedExts))].join(", ")}`
       );
     }
 
-    const extMap = {
-      "image/jpeg": ".jpg",
-      "image/png": ".png",
-      "image/gif": ".gif",
-      "image/webp": ".webp",
-      "image/tiff": ".tiff",
-      "image/bmp": ".bmp",
-    };
-    const ext = extMap[mimeStr];
+    // Encode to base64 internally, then decode to a temp file — keeps the base64 code
+    // path exercised without ever routing the raw string through the LLM.
+    const b64Str = fs.readFileSync(file_path).toString("base64");
     const tempFile = path.join(os.tmpdir(), `ocr_b64_${Date.now()}${ext}`);
 
     try {
@@ -1965,7 +1978,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     //       Falls back to `tesseract <input> <stem> pdf` if the service is unreachable.
     // Test: Mock fetch to return a PDF buffer; assert pdf_path ends in .pdf and size_bytes > 0.
     //       Mock fetch to throw; assert fallback_reason is set and pdf_path still exists.
-    const { image_path, deskew = true, optimize = 1 } = args;
+    const { image_path, output_path, deskew = true, optimize = 1, image_dpi = 300 } = args;
 
     if (!image_path || typeof image_path !== "string") {
       throw new Error("image_path must be a non-empty string");
@@ -1976,12 +1989,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
     const dir = path.dirname(image_path);
     const stem = path.basename(image_path, path.extname(image_path));
-    const pdfPath = path.join(dir, `${stem}.pdf`);
+    // Honor the caller-supplied output_path; only derive a default from the input
+    // basename when none is provided. (Bug: output_path was previously ignored.)
+    const pdfPath = (output_path && typeof output_path === "string")
+      ? output_path
+      : path.join(dir, `${stem}.pdf`);
+
+    const ext = path.extname(image_path).slice(1).toLowerCase() || "jpg";
+    // Image inputs lack DPI metadata when created without -density; ocrmypdf requires
+    // an explicit --image-dpi for those. PDFs carry their own resolution, so DPI only
+    // applies to non-PDF (image) inputs.
+    const isImageInput = ext !== "pdf";
 
     // Attempt remote ocrmypdf service first
     try {
       const fileBytes = fs.readFileSync(image_path);
-      const ext = path.extname(image_path).slice(1).toLowerCase() || "jpg";
       const mimeMap = {
         jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
         gif: "image/gif", webp: "image/webp", tiff: "image/tiff",
@@ -1997,6 +2019,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         optimize: String(optimize),
         rotate_pages: 'true',
       });
+      // Always send image_dpi for image inputs so stock JPEGs without embedded DPI
+      // metadata don't fail with "Input file is an image but has no resolution (DPI)".
+      if (isImageInput) {
+        params.set('image_dpi', String(image_dpi));
+      }
 
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), 60000);
@@ -2035,8 +2062,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         : `ocrmypdf service unreachable: ${remoteErr.message}`;
 
       try {
-        const outStem = path.join(dir, stem);
-        await execFileAsync("tesseract", [image_path, outStem, "pdf"]);
+        // Local ocrmypdf CLI fallback — forward --image-dpi for image inputs so stock
+        // JPEGs without DPI metadata succeed, and write directly to the requested pdfPath.
+        const ocrmypdfArgs = ['--rotate-pages', '--optimize', String(optimize)];
+        if (deskew) ocrmypdfArgs.push('--deskew');
+        if (isImageInput) ocrmypdfArgs.push('--image-dpi', String(image_dpi));
+        ocrmypdfArgs.push(image_path, pdfPath);
+        await execFileAsync("ocrmypdf", ocrmypdfArgs);
         const size = fs.statSync(pdfPath).size;
         return {
           content: [
@@ -2047,9 +2079,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           ],
         };
       } catch (localErr) {
-        throw new Error(
-          `ocrmypdf service failed (${fallbackReason}) and local tesseract fallback also failed: ${localErr.message}`
-        );
+        // Last resort: bare tesseract pdf mode. tesseract appends ".pdf" to the stem,
+        // so derive the stem from pdfPath to honor the requested output location.
+        try {
+          const outStem = pdfPath.replace(/\.pdf$/i, "");
+          await execFileAsync("tesseract", [image_path, outStem, "pdf"]);
+          const size = fs.statSync(pdfPath).size;
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ pdf_path: pdfPath, size_bytes: size, fallback_reason: fallbackReason }),
+              },
+            ],
+          };
+        } catch (tesseractErr) {
+          throw new Error(
+            `ocrmypdf service failed (${fallbackReason}), local ocrmypdf failed (${localErr.message}), and tesseract fallback also failed: ${tesseractErr.message}`
+          );
+        }
       }
     }
   }
@@ -2733,7 +2781,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   if (name === "fetch_url_as_base64") {
     // Why: Lets receipts-agent pull bytes from authenticated callbacks (e.g., receipts-web
     //      /api/inbox/raw) without proliferating per-service tools. Returns base64 so the
-    //      payload survives JSON transport and can be fed straight to ocr_image_from_base64.
+    //      payload survives JSON transport (e.g. a client can decode it to a local file
+    //      and then OCR via ocr_image_from_base64, which now takes a file path).
     // What: Performs a single HTTP request with caller-controlled method/body/auth, enforces
     //       a 30s timeout and a configurable max response size, and returns
     //       { ok, status, content_type, size_bytes, base64 } or { ok:false, status?, error }.
