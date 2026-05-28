@@ -1420,7 +1420,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "nextcloud_move",
-      description: "Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning. source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/123-Sample-Dr/Mortage/old.pdf). Returns success and the new full URL.",
+      description: "Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning, or to move a file into a different directory — cross-directory moves are fully supported (verified working in testing). source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/123-Sample-Dr/Mortage/old.pdf). Returns success and the new full URL.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1430,7 +1430,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           dest_path: {
             type: "string",
-            description: "New full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_rocket-mortgage.pdf). Must be in the same folder for a rename.",
+            description: "New full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_rocket-mortgage.pdf). May be in a different folder than source_path — cross-directory moves are fully supported.",
           },
         },
         required: ["source_path", "dest_path"],
@@ -2483,9 +2483,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
   if (name === "nextcloud_move") {
     const { source_path, dest_path } = args;
+
+    // Pre-validate identical paths: Nextcloud otherwise returns an opaque HTTP 403
+    // ("Source and destination uri are identical"). Catch it here with a clear message.
+    if (source_path.trim() === dest_path.trim()) {
+      return {
+        content: [{ type: 'text', text: 'Source and destination paths are identical — no move needed.' }],
+      };
+    }
+
+    // Encode each path segment so filenames containing & ? # % do not corrupt the
+    // WebDAV URL, while preserving the / directory separators.
+    const encodePath = (p) => p.split('/').map(encodeURIComponent).join('/');
+
     const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
-    const sourceUrl = `${NEXTCLOUD_WEBDAV_BASE}${source_path}`;
-    const destUrl   = `${NEXTCLOUD_WEBDAV_BASE}${dest_path}`;
+    const sourceUrl = `${NEXTCLOUD_WEBDAV_BASE}${encodePath(source_path)}`;
+    const destUrl   = `${NEXTCLOUD_WEBDAV_BASE}${encodePath(dest_path)}`;
 
     const resp = await fetch(sourceUrl, {
       method: 'MOVE',
