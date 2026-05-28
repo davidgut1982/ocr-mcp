@@ -1,21 +1,28 @@
-import { execFile, execSync } from 'node:child_process';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { promisify } from 'node:util';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { execSync } from "child_process";
+import { promisify } from "util";
+import { execFile } from "child_process";
+import path from "path";
+import fs from "fs";
+import os from "os";
+import { randomUUID } from "node:crypto";
+
 
 const execFileAsync = promisify(execFile);
 
 const POLYCR_HOST = process.env.POLYCR_HOST || '192.168.1.30';
 const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
 const POLYCR_PDF_URL = process.env.POLYCR_PDF_URL || `http://${new URL(POLYCR_URL).hostname}:8001`;
+const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
 
 const SCANNERS = {
   'hp-officejet-5740': process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080',
-  'canon-mf741c': 'airscan:e0:Canon MF741C',
+  'canon-mf741c':      'airscan:e0:Canon MF741C',
 };
 // Default scanner
 const DEFAULT_SCANNER = SCANNERS['canon-mf741c'];
@@ -33,10 +40,11 @@ const NEXTCLOUD_WEBDAV_BASE = `${NEXTCLOUD_URL}/remote.php/dav/files/${NEXTCLOUD
 const CANON_ESCL_BASE = process.env.CANON_ESCL_BASE || 'http://192.168.1.141';
 
 // Minimum JPEG file size (bytes) below which a scanned page is treated as blank and discarded.
-// Blank pages at 300 DPI Color are 144–185 KB, but in AdfDuplex mode the Canon uses Color.
-// Content pages with even light text are typically >150 KB. 100 KB catches true blanks while
-// keeping light-content pages.
-const BLANK_PAGE_THRESHOLD_BYTES = 100_000;
+// Blank pages at 300 DPI Color are 144–185 KB; in AdfDuplex mode the Canon also auto-scans
+// the flatbed after the ADF is exhausted, producing a blank Color JPEG in that range.
+// Threshold raised to 200 KB to reliably catch both duplex back-sides and Canon's trailing
+// flatbed page. Real content pages (even light text at 300 DPI) are consistently >200 KB.
+const BLANK_PAGE_THRESHOLD_BYTES = 200_000;
 
 // LiteLLM proxy — OpenAI-compatible endpoint on the local network.
 // Used for LLM-based OCR reconciliation: all engine outputs are fed to the
@@ -44,6 +52,75 @@ const BLANK_PAGE_THRESHOLD_BYTES = 100_000;
 const LITELLM_URL = process.env.LITELLM_URL || 'http://192.168.1.19:4000/v1/chat/completions';
 const LITELLM_KEY = process.env.LITELLM_KEY || 'sk-litellm-openclaw';
 const LITELLM_MODEL = process.env.LITELLM_MODEL || 'auto';
+
+// Why: Provides a promisified sleep for async retry loops and rate-limit backoff.
+// What: Returns a Promise that resolves after `ms` milliseconds.
+// Test: Assert `await delay(50)` completes without error and takes ~50ms.
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// ─── Background scan job state ────────────────────────────────────────────────
+// Supports scan_and_file_async + get_scan_job_status + get_scan_job_result.
+// Jobs live in memory for 1 hour after completion, then are purged.
+
+const JOB_RETENTION_MS = 60 * 60 * 1000; // 1 hour
+const scanJobs = new Map();
+let activeScanJobId = null;
+
+function createScanJob() {
+  if (activeScanJobId) {
+    const active = scanJobs.get(activeScanJobId);
+    if (active && (active.status === 'PENDING' || active.status === 'RUNNING')) {
+      const err = new Error(`Scan already in progress (job_id=${activeScanJobId}, status=${active.status})`);
+      err.code = 'SCAN_ALREADY_RUNNING';
+      throw err;
+    }
+  }
+  const job_id = `scan_${randomUUID()}`;
+  const state = {
+    job_id,
+    status: 'PENDING',
+    progress: { stage: 'queued', current_page: 0, total_pages: null },
+    started_at: new Date().toISOString(),
+    completed_at: null,
+    error: null,
+    result: null,
+  };
+  scanJobs.set(job_id, state);
+  activeScanJobId = job_id;
+  return state;
+}
+
+function updateScanJob(job_id, patch) {
+  const state = scanJobs.get(job_id);
+  if (!state) return;
+  if (patch.progress) {
+    Object.assign(state.progress, patch.progress);
+    delete patch.progress;
+  }
+  Object.assign(state, patch);
+}
+
+function finishScanJob(job_id, status, payload) {
+  const state = scanJobs.get(job_id);
+  if (!state) return;
+  state.status = status;
+  state.completed_at = new Date().toISOString();
+  if (status === 'COMPLETED') state.result = payload;
+  if (status === 'FAILED') state.error = String(payload?.message ?? payload ?? 'unknown error');
+  if (activeScanJobId === job_id) activeScanJobId = null;
+}
+
+// Purge completed/failed/cancelled jobs older than JOB_RETENTION_MS
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, state] of scanJobs.entries()) {
+    if (state.completed_at) {
+      const age = now - new Date(state.completed_at).getTime();
+      if (age > JOB_RETENTION_MS) scanJobs.delete(id);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Helper: derive default output path from input path
 function defaultOutputPath(filePath) {
@@ -57,34 +134,33 @@ function defaultOutputPath(filePath) {
 // What: Splits text on whitespace and counts non-empty tokens.
 // Test: Assert countWords("hello world") === 2, countWords("") === 0, countWords(null) === 0.
 function countWords(text) {
-  if (!text || typeof text !== 'string') return 0;
-  return text
-    .trim()
-    .split(/\s+/)
-    .filter((w) => w.length > 0).length;
+  if (!text || typeof text !== "string") return 0;
+  return text.trim().split(/\s+/).filter((w) => w.length > 0).length;
 }
 
 // Why: Provides a local Tesseract fallback when the polycr service is unavailable.
 // What: Runs tesseract twice (text + TSV for confidence), returns text, confidence, word_count, empty.
 // Test: Call with a known image, assert text is non-empty and confidence is a number between 0 and 1.
 async function runLocalTesseract(filePath, language) {
-  const lang = language || 'eng';
+  const lang = language || "eng";
   const [textResult, tsvResult] = await Promise.all([
-    execFileAsync('tesseract', [filePath, 'stdout', '-l', lang]),
-    execFileAsync('tesseract', [filePath, 'stdout', '-l', lang, 'tsv']),
+    execFileAsync("tesseract", [filePath, "stdout", "-l", lang]),
+    execFileAsync("tesseract", [filePath, "stdout", "-l", lang, "tsv"]),
   ]);
   const text = textResult.stdout;
-  const lines = tsvResult.stdout.split('\n').slice(1);
+  const lines = tsvResult.stdout.split("\n").slice(1);
   const confs = lines
     .map((l) => {
-      const cols = l.split('\t');
-      const level = Number.parseInt(cols[0], 10);
-      const conf = Number.parseFloat(cols[10]);
+      const cols = l.split("\t");
+      const level = parseInt(cols[0], 10);
+      const conf = parseFloat(cols[10]);
       return level === 5 && conf >= 0 ? conf : null;
     })
     .filter((c) => c !== null);
   const confidence =
-    confs.length > 0 ? Math.round(confs.reduce((a, b) => a + b, 0) / confs.length) / 100 : null;
+    confs.length > 0
+      ? Math.round(confs.reduce((a, b) => a + b, 0) / confs.length) / 100
+      : null;
   const wc = countWords(text);
   return { text, confidence, word_count: wc, empty: wc === 0 };
 }
@@ -94,50 +170,51 @@ async function runLocalTesseract(filePath, language) {
 // Test: Mock fetch to return a valid engine response; assert result is non-null and fallback_reason is null.
 async function callPolycr(filePath, language) {
   const fileBytes = fs.readFileSync(filePath);
-  const ext = path.extname(filePath).slice(1).toLowerCase() || 'jpg';
+  const ext = path.extname(filePath).slice(1).toLowerCase() || "jpg";
   const mimeMap = {
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    png: 'image/png',
-    gif: 'image/gif',
-    webp: 'image/webp',
-    tiff: 'image/tiff',
-    bmp: 'image/bmp',
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    gif: "image/gif",
+    webp: "image/webp",
+    tiff: "image/tiff",
+    bmp: "image/bmp",
   };
-  const mime = mimeMap[ext] || 'application/octet-stream';
-  const lang = language || 'eng';
+  const mime = mimeMap[ext] || "application/octet-stream";
+  const lang = language || "eng";
 
   const MAX_ATTEMPTS = 2;
   const COLD_START_DELAY_MS = 10_000;
-  let _lastErr;
+  let lastErr;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const blob = new Blob([fileBytes], { type: mime });
     const form = new FormData();
-    form.append('file', blob, path.basename(filePath));
-    form.append('language', lang);
+    form.append("file", blob, path.basename(filePath));
+    form.append("language", lang);
     const ac = new AbortController();
     // 90s timeout — PaddleOCR cold-start after container recreation can take 50-60s
     const timer = setTimeout(() => ac.abort(), 90000);
     try {
       const resp = await fetch(`${POLYCR_URL}/ocr/raw`, {
-        method: 'POST',
+        method: "POST",
         body: form,
         signal: ac.signal,
       });
       clearTimeout(timer);
-      if (!resp.ok) return { result: null, fallback_reason: `polycr HTTP ${resp.status}` };
+      if (!resp.ok)
+        return { result: null, fallback_reason: `polycr HTTP ${resp.status}` };
       const data = await resp.json();
       return { result: data, fallback_reason: null };
     } catch (err) {
       clearTimeout(timer);
-      _lastErr = err;
+      lastErr = err;
       const isRetryable =
-        err?.name === 'AbortError' ||
-        err?.code === 'ECONNREFUSED' ||
-        err?.code === 'ETIMEDOUT' ||
-        err?.cause?.code === 'ECONNREFUSED' ||
-        err?.cause?.code === 'ETIMEDOUT' ||
+        err?.name === "AbortError" ||
+        err?.code === "ECONNREFUSED" ||
+        err?.code === "ETIMEDOUT" ||
+        err?.cause?.code === "ECONNREFUSED" ||
+        err?.cause?.code === "ETIMEDOUT" ||
         /fetch failed/i.test(String(err?.message ?? err));
       if (attempt < MAX_ATTEMPTS && isRetryable) {
         console.error(
@@ -146,10 +223,12 @@ async function callPolycr(filePath, language) {
         await new Promise((r) => setTimeout(r, COLD_START_DELAY_MS));
         continue;
       }
-      const isTimeout = err.name === 'AbortError';
+      const isTimeout = err.name === "AbortError";
       return {
         result: null,
-        fallback_reason: isTimeout ? 'polycr timeout (90s)' : `polycr unreachable: ${err.message}`,
+        fallback_reason: isTimeout
+          ? "polycr timeout (90s)"
+          : `polycr unreachable: ${err.message}`,
       };
     }
   }
@@ -162,29 +241,21 @@ async function callPolycr(filePath, language) {
 // Test: Pass results where two engines agree first line "DECRAENES SERVICE CENTER" and third has more
 //       words but disagrees — assert the consensus engine wins.
 function pickBestPolycr(data) {
-  const results = (data.results || []).filter((r) => r && typeof r.text === 'string' && !r.error);
+  const results = (data.results || []).filter(r => r && typeof r.text === 'string' && !r.error);
   if (results.length === 0) return null;
 
   // Normalize first non-empty line for consensus comparison
   function firstLine(text) {
-    return (
-      text
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .find((l) => l.length > 0) || ''
-    )
-      .toLowerCase()
-      .replace(/\s+/g, ' ');
+    return (text.split(/\r?\n/).map(l => l.trim()).find(l => l.length > 0) || '')
+      .toLowerCase().replace(/\s+/g, ' ');
   }
 
   // Drop very low confidence results unless they're the only ones
-  const confident = results.filter(
-    (r) => (typeof r.confidence === 'number' ? r.confidence : 0) >= 15
-  );
+  const confident = results.filter(r => (typeof r.confidence === 'number' ? r.confidence : 0) >= 15);
   const pool = confident.length > 0 ? confident : results;
 
   // Count first-line agreement
-  const firstLines = pool.map((r) => firstLine(r.text));
+  const firstLines = pool.map(r => firstLine(r.text));
   const lineCounts = {};
   for (const l of firstLines) lineCounts[l] = (lineCounts[l] || 0) + 1;
   const consensusLine = Object.entries(lineCounts).sort((a, b) => b[1] - a[1])[0];
@@ -238,7 +309,7 @@ async function reconcileOcrWithLLM(engineResults) {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${LITELLM_KEY}`,
+            'Authorization': `Bearer ${LITELLM_KEY}`,
           },
           body: JSON.stringify({
             model: LITELLM_MODEL,
@@ -254,10 +325,10 @@ async function reconcileOcrWithLLM(engineResults) {
       if (!resp.ok) {
         console.error(`reconcileOcrWithLLM: attempt ${attempt} failed with HTTP ${resp.status}`);
         if (resp.status === 429) {
-          if (attempt < 3) await new Promise((r) => setTimeout(r, 2000));
+          if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
           continue;
         } else if (resp.status >= 500) {
-          if (attempt < 3) await new Promise((r) => setTimeout(r, 500));
+          if (attempt < 3) await new Promise(r => setTimeout(r, 500));
           continue;
         } else {
           break;
@@ -272,7 +343,7 @@ async function reconcileOcrWithLLM(engineResults) {
       return content.trim();
     } catch (err) {
       console.error(`reconcileOcrWithLLM: attempt ${attempt} threw`, err);
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 200));
+      if (attempt < 3) await new Promise(r => setTimeout(r, 200));
     }
   }
   return null;
@@ -291,8 +362,8 @@ async function ocrWithFallback(filePath, language) {
   if (result) {
     // Collect all engine results that produced usable text
     const engineResults = (result.results || [])
-      .filter((r) => r && typeof r.text === 'string' && !r.error && countWords(r.text) > 0)
-      .map((r) => ({ engine: r.engine || 'unknown', text: r.text }));
+      .filter(r => r && typeof r.text === 'string' && !r.error && countWords(r.text) > 0)
+      .map(r => ({ engine: r.engine || 'unknown', text: r.text }));
 
     // Try LLM reconciliation whenever at least 1 engine produced output.
     // Even a single engine result benefits from LLM correction of typos and proper nouns.
@@ -308,9 +379,7 @@ async function ocrWithFallback(filePath, language) {
           fallback_reason: undefined,
         };
       }
-      console.error(
-        `ocrWithFallback: LLM reconciliation returned null, falling back to pickBestPolycr`
-      );
+      console.error(`ocrWithFallback: LLM reconciliation returned null, falling back to pickBestPolycr`);
     }
 
     // LLM unavailable or only 1 engine — fall back to consensus scoring
@@ -327,32 +396,59 @@ async function ocrWithFallback(filePath, language) {
       };
     }
   }
-  console.error(
-    `ocrWithFallback: polycr unavailable (${fallback_reason || 'no result'}), falling back to local Tesseract`
-  );
+  console.error(`ocrWithFallback: polycr unavailable (${fallback_reason || 'no result'}), falling back to local Tesseract`);
   const local = await runLocalTesseract(filePath, language);
   return {
     text: local.text,
-    engine_used: 'tesseract-local',
+    engine_used: "tesseract-local",
     confidence: local.confidence,
     word_count: local.word_count,
     empty: local.empty,
-    fallback_reason: fallback_reason || 'polycr returned no engine results',
+    fallback_reason: fallback_reason || "polycr returned no engine results",
   };
 }
 
 // Keyword signal map for document classification heuristics.
 const EVENT_SIGNALS = {
-  invite: ['invite', 'invited', 'invitation'],
-  rsvp: ['rsvp', 'r.s.v.p', 'kindly respond', 'please respond', 'regrets only'],
-  birthday: ['birthday', 'bday', 'turning', 'years old', 'happy birthday'],
-  party: ['party', 'celebration', 'celebrate', 'soiree', 'gathering', 'get-together'],
-  wedding: ['wedding', 'nuptials', 'reception', 'ceremony', 'bridal', 'rehearsal dinner'],
-  baby_shower: ['baby shower', 'baby sprinkle', 'gender reveal', 'expecting'],
-  graduation: ['graduation', 'commencement', 'graduate', 'diploma'],
-  holiday: ['holiday', 'christmas', 'hanukkah', 'halloween', 'thanksgiving', 'new year'],
-  fundraiser: ['fundraiser', 'fundraising', 'donation', 'gala', 'benefit'],
-  receipt: ['receipt', 'total', 'subtotal', 'tax', 'amount due', 'paid', 'invoice'],
+  invite: ["invite", "invited", "invitation"],
+  rsvp: ["rsvp", "r.s.v.p", "kindly respond", "please respond", "regrets only"],
+  birthday: ["birthday", "bday", "turning", "years old", "happy birthday"],
+  party: [
+    "party",
+    "celebration",
+    "celebrate",
+    "soiree",
+    "gathering",
+    "get-together",
+  ],
+  wedding: [
+    "wedding",
+    "nuptials",
+    "reception",
+    "ceremony",
+    "bridal",
+    "rehearsal dinner",
+  ],
+  baby_shower: ["baby shower", "baby sprinkle", "gender reveal", "expecting"],
+  graduation: ["graduation", "commencement", "graduate", "diploma"],
+  holiday: [
+    "holiday",
+    "christmas",
+    "hanukkah",
+    "halloween",
+    "thanksgiving",
+    "new year",
+  ],
+  fundraiser: ["fundraiser", "fundraising", "donation", "gala", "benefit"],
+  receipt: [
+    "receipt",
+    "total",
+    "subtotal",
+    "tax",
+    "amount due",
+    "paid",
+    "invoice",
+  ],
 };
 
 // Why: Provides lightweight document type detection without an ML model dependency.
@@ -369,7 +465,7 @@ function classifyDocument(text) {
       }
     }
   }
-  const likely = signals.length > 0 ? signals[0].type : 'unknown';
+  const likely = signals.length > 0 ? signals[0].type : "unknown";
   return { likely_document_type: likely, document_signals: signals };
 }
 
@@ -380,13 +476,13 @@ function classifyDocument(text) {
 // What: Returns { mode, source, format } for a given profile string.
 // Test: Assert PROFILE_PARAMS['doc-bw'].mode === 'Gray' and PROFILE_PARAMS['photo'].mode === 'Color'.
 const PROFILE_PARAMS = {
-  'doc-bw': { mode: 'Gray', source: 'Flatbed', format: 'jpeg' },
-  'doc-bw-adf': { mode: 'Gray', source: 'ADF', format: 'jpeg' },
-  'doc-color': { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
-  receipt: { mode: 'Gray', source: 'Flatbed', format: 'jpeg' },
-  'id-card': { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
-  photo: { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
-  event: { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
+  'doc-bw':     { mode: 'Gray',  source: 'Flatbed', format: 'jpeg' },
+  'doc-bw-adf': { mode: 'Gray',  source: 'ADF',     format: 'jpeg' },
+  'doc-color':  { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
+  'receipt':    { mode: 'Gray',  source: 'Flatbed', format: 'jpeg' },
+  'id-card':    { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
+  'photo':      { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
+  'event':      { mode: 'Color', source: 'Flatbed', format: 'jpeg' },
 };
 
 // Why: Centralizes filing classification so the atomic pipeline tool routes each
@@ -396,16 +492,14 @@ const PROFILE_PARAMS = {
 // Test: Call with profile='receipt', assert path === '/Personal/Financial/Receipts/'.
 //       Call with text containing "prescription", assert type === 'medical'.
 function classifyDocumentForFiling(text, profile, description) {
-  const lower = `${text} ${description || ''}`.toLowerCase();
+  const lower = (text + ' ' + (description || '')).toLowerCase();
 
-  if (profile === 'receipt') return { type: 'receipt', path: '/Personal/Financial/Receipts/' };
-  if (profile === 'photo') return { type: 'photo', path: '/Media/Photos/' };
-  if (profile === 'event') return { type: 'event', path: null };
+  if (profile === 'receipt')  return { type: 'receipt',       path: '/Personal/Financial/Receipts/' };
+  if (profile === 'photo')    return { type: 'photo',         path: '/Media/Photos/' };
+  if (profile === 'event')    return { type: 'event',         path: null };
   if (profile === 'id-card') {
-    if (lower.match(/insurance|coverage|member/))
-      return { type: 'insurance-card', path: '/Personal/Insurance/' };
-    if (lower.match(/latvia|latvian/))
-      return { type: 'latvian-id', path: '/Personal/Identity/Latvian-Citizenship/' };
+    if (lower.match(/insurance|coverage|member/)) return { type: 'insurance-card', path: '/Personal/Insurance/' };
+    if (lower.match(/latvia|latvian/))            return { type: 'latvian-id',     path: '/Personal/Identity/Latvian-Citizenship/' };
     return { type: 'id', path: '/Personal/Identity/' };
   }
 
@@ -428,17 +522,17 @@ function classifyDocumentForFiling(text, profile, description) {
   //       (after substituting the most recent 4-digit year if detect_year is set).
   // Test: Add a rule with keywords:["subaru"] path:"/Auto/"; pass text containing both
   //       "subaru" and "123 sample dr"; assert type==="auto" and path==="/Auto/".
-  for (const rule of routingRules.custom_rules || []) {
+  for (const rule of (routingRules.custom_rules || [])) {
     const keywords = rule.keywords || [];
-    if (keywords.some((kw) => lower.includes(kw.toLowerCase()))) {
+    if (keywords.some(kw => lower.includes(kw.toLowerCase()))) {
       let rulePath = rule.path;
       if (rule.detect_year && rulePath.includes('{year}')) {
         // Extract year from OCR text; prefer most recent plausible year (2000–currentYear+1)
         const yearMatch = text.match(/\b(20\d{2})\b/g);
         const currentYear = new Date().getFullYear();
         const years = (yearMatch || [])
-          .map((y) => Number.parseInt(y, 10))
-          .filter((y) => y >= 2000 && y <= currentYear + 1);
+          .map(y => parseInt(y))
+          .filter(y => y >= 2000 && y <= currentYear + 1);
         const year = years.length > 0 ? Math.max(...years) : currentYear;
         rulePath = rulePath.replace('{year}', year);
       }
@@ -450,38 +544,34 @@ function classifyDocumentForFiling(text, profile, description) {
   // Why: Property address keywords (e.g. "123 sample dr") appear on many documents simply
   //      because they are the customer's mailing address — they should only route to a
   //      property folder when no more-specific document-type rule matched first.
-  for (const prop of routingRules.properties || []) {
+  for (const prop of (routingRules.properties || [])) {
     const keywords = prop.keywords || [prop.address];
-    if (keywords.some((kw) => lower.includes(kw.toLowerCase()))) {
+    if (keywords.some(kw => lower.includes(kw.toLowerCase()))) {
       return { type: 'housing', path: prop.path };
     }
   }
 
   if (lower.match(/invoice|receipt|total\s*\$|subtotal|thank you for your (purchase|order)/))
-    return { type: 'receipt', path: '/Personal/Financial/Receipts/' };
+    return { type: 'receipt',   path: '/Personal/Financial/Receipts/' };
   if (lower.match(/prescription|diagnosis|patient|physician|hospital|lab result|immunization/))
-    return { type: 'medical', path: '/Personal/Health/Medical/' };
+    return { type: 'medical',   path: '/Personal/Health/Medical/' };
   if (lower.match(/insurance|policy number|coverage|premium|claim number/))
     return { type: 'insurance', path: '/Personal/Insurance/' };
   if (lower.match(/\b(irs|1099|w-2|w2|tax return|adjusted gross|refund)\b/))
-    return { type: 'tax', path: '/Personal/Financial/Taxes/' };
+    return { type: 'tax',       path: '/Personal/Financial/Taxes/' };
   // mortgage/loan before legal — boilerplate like "hereby" appears in mortgage letters
-  if (
-    lower.match(
-      /rocket mortgage|mortgage statement|loan number|autopay confirmation|escrow|homeowner/
-    )
-  )
-    return { type: 'housing', path: '/Personal/Housing/' };
+  if (lower.match(/rocket mortgage|mortgage statement|loan number|autopay confirmation|escrow|homeowner/))
+    return { type: 'housing',   path: '/Personal/Housing/' };
   if (lower.match(/mortgage|loan statement|student loan/))
     return { type: 'financial', path: '/Personal/Financial/' };
   if (lower.match(/attorney|court|legal|plaintiff|defendant|judgment|hereby/))
-    return { type: 'legal', path: '/Personal/Legal/' };
+    return { type: 'legal',     path: '/Personal/Legal/' };
   if (lower.match(/lease|landlord|tenant|rental agreement|property/))
-    return { type: 'housing', path: '/Personal/Housing/' };
+    return { type: 'housing',   path: '/Personal/Housing/' };
   if (lower.match(/vehicle|registration|vehicle\s*title|certificate\s*of\s*title|dmv|vin\b/))
-    return { type: 'auto', path: '/Personal/Auto/' };
+    return { type: 'auto',      path: '/Personal/Auto/' };
   if (lower.match(/theodore|teddy|daycare|preschool/))
-    return { type: 'theodore', path: '/Personal/Theodore/' };
+    return { type: 'theodore',  path: '/Personal/Theodore/' };
 
   return { type: 'document', path: '/Inbox/' };
 }
@@ -502,7 +592,7 @@ function classifyDocumentForFiling(text, profile, description) {
 // Test: Call with text containing "Invoice Date: November 7, 2025" from "DeCraenes Service
 //       Center"; assert result is { date: '2025-11-07', slug: 'DeCraenes_Service_Center_Invoice' }.
 async function generateFilenamePartsWithLLM(ocrText, classification) {
-  const _today = new Date().toISOString().split('T')[0];
+  const today = new Date().toISOString().split('T')[0];
   const snippet = ocrText.slice(0, 1200);
   const prompt =
     `You are a document filing assistant. Extract the document date and generate a filename slug.\n\n` +
@@ -538,16 +628,12 @@ async function generateFilenamePartsWithLLM(ocrText, classification) {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${LITELLM_KEY}`,
+            'Authorization': `Bearer ${LITELLM_KEY}`,
           },
           body: JSON.stringify({
             model: LITELLM_MODEL,
             messages: [
-              {
-                role: 'system',
-                content:
-                  'You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.',
-              },
+              { role: 'system', content: 'You are a document filing assistant. You generate short filename slugs that identify WHO issued the document, not WHERE it was filed.' },
               { role: 'user', content: prompt },
             ],
             max_tokens: 64,
@@ -559,14 +645,12 @@ async function generateFilenamePartsWithLLM(ocrText, classification) {
         clearTimeout(timer);
       }
       if (!resp.ok) {
-        console.error(
-          `generateFilenamePartsWithLLM: attempt ${attempt} failed with HTTP ${resp.status}`
-        );
+        console.error(`generateFilenamePartsWithLLM: attempt ${attempt} failed with HTTP ${resp.status}`);
         if (resp.status === 429) {
-          if (attempt < 3) await new Promise((r) => setTimeout(r, 2000));
+          if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
           continue;
         } else if (resp.status >= 500) {
-          if (attempt < 3) await new Promise((r) => setTimeout(r, 500));
+          if (attempt < 3) await new Promise(r => setTimeout(r, 500));
           continue;
         } else {
           break;
@@ -575,25 +659,20 @@ async function generateFilenamePartsWithLLM(ocrText, classification) {
       const data = await resp.json();
       const candidate = data?.choices?.[0]?.message?.content;
       if (!candidate || typeof candidate !== 'string') {
-        console.error(
-          `generateFilenamePartsWithLLM: attempt ${attempt} returned empty or invalid content`
-        );
+        console.error(`generateFilenamePartsWithLLM: attempt ${attempt} returned empty or invalid content`);
         break;
       }
       raw = candidate;
       break;
     } catch (err) {
       console.error(`generateFilenamePartsWithLLM: attempt ${attempt} threw`, err);
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 200));
+      if (attempt < 3) await new Promise(r => setTimeout(r, 200));
     }
   }
 
   if (!raw) return null;
 
-  const lines = raw
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
   if (lines.length < 2) return null;
 
   const dateLine = lines[0];
@@ -633,73 +712,49 @@ async function generateFilename(text, classification, description, ext) {
 
   // Regex date extraction — runs when LLM is unavailable or returned UNKNOWN date.
   const months = {
-    january: '01',
-    february: '02',
-    march: '03',
-    april: '04',
-    may: '05',
-    june: '06',
-    july: '07',
-    august: '08',
-    september: '09',
-    october: '10',
-    november: '11',
-    december: '12',
-    jan: '01',
-    feb: '02',
-    mar: '03',
-    apr: '04',
-    jun: '06',
-    jul: '07',
-    aug: '08',
-    sep: '09',
-    oct: '10',
-    nov: '11',
-    dec: '12',
+    january:'01', february:'02', march:'03',    april:'04',
+    may:'05',     june:'06',     july:'07',      august:'08',
+    september:'09', october:'10', november:'11', december:'12',
+    jan:'01', feb:'02', mar:'03', apr:'04',
+    jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12',
   };
 
   let dateStr = null;
-  const m1 = text.match(/\b(\d{4})[/-](\d{2})[/-](\d{2})\b/);
-  const m2 = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/);
-  const m3 = text.match(
-    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})\b/i
-  );
-  const m3b = text.match(
-    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{1,2}),?\s+(\d{4})\b/i
-  );
-  const m3c = text.match(
-    /\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{4})\b/i
-  );
-  const m2b = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{2})\b/);
+  const m1  = text.match(/\b(\d{4})[\/\-](\d{2})[\/\-](\d{2})\b/);
+  const m2  = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
+  const m3  = text.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})\b/i);
+  const m3b = text.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{1,2}),?\s+(\d{4})\b/i);
+  const m3c = text.match(/\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{4})\b/i);
+  const m2b = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})\b/);
 
   // m1: ISO-style YYYY-MM-DD — validate year, month, day ranges
   if (m1) {
-    const yr = Number.parseInt(m1[1], 10);
-    const mo = Number.parseInt(m1[2], 10);
-    const dy = Number.parseInt(m1[3], 10);
+    const yr = parseInt(m1[1], 10);
+    const mo = parseInt(m1[2], 10);
+    const dy = parseInt(m1[3], 10);
     if (yr >= 1900 && yr <= 2099 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
       dateStr = `${m1[1]}-${m1[2].padStart(2, '0')}-${m1[3].padStart(2, '0')}`;
     }
   }
   // m2: US-style MM/DD/YYYY — validate month, day, year ranges
   if (!dateStr && m2) {
-    const mo = Number.parseInt(m2[1], 10);
-    const dy = Number.parseInt(m2[2], 10);
-    const yr = Number.parseInt(m2[3], 10);
+    const mo = parseInt(m2[1], 10);
+    const dy = parseInt(m2[2], 10);
+    const yr = parseInt(m2[3], 10);
     if (yr >= 1900 && yr <= 2099 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
       dateStr = `${m2[3]}-${m2[1].padStart(2, '0')}-${m2[2].padStart(2, '0')}`;
     }
   }
   // m3: long-form "Month D, YYYY"
   if (!dateStr && m3) {
-    const yr = Number.parseInt(m3[3], 10);
+    const yr = parseInt(m3[3], 10);
     if (yr >= 1900 && yr <= 2099) {
       dateStr = `${m3[3]}-${months[m3[1].toLowerCase()]}-${m3[2].padStart(2, '0')}`;
     }
   }
   // m3b: abbreviated month "Nov 7, 2025" or "Nov. 7, 2025"
   if (!dateStr && m3b) {
-    const yr = Number.parseInt(m3b[3], 10);
+    const yr = parseInt(m3b[3], 10);
     const key = m3b[1].toLowerCase().replace('.', '');
     if (yr >= 1900 && yr <= 2099 && months[key]) {
       dateStr = `${m3b[3]}-${months[key]}-${m3b[2].padStart(2, '0')}`;
@@ -707,7 +762,7 @@ async function generateFilename(text, classification, description, ext) {
   }
   // m3c: day-first abbreviated "7 Nov 2025" or "15 Jan 2026"
   if (!dateStr && m3c) {
-    const yr = Number.parseInt(m3c[3], 10);
+    const yr = parseInt(m3c[3], 10);
     const key = m3c[2].toLowerCase().replace('.', '');
     if (yr >= 1900 && yr <= 2099 && months[key]) {
       dateStr = `${m3c[3]}-${months[key]}-${m3c[1].padStart(2, '0')}`;
@@ -715,9 +770,9 @@ async function generateFilename(text, classification, description, ext) {
   }
   // m2b: two-digit year US-style "11/07/25" or "1/15/26"
   if (!dateStr && m2b) {
-    const mo = Number.parseInt(m2b[1], 10);
-    const dy = Number.parseInt(m2b[2], 10);
-    const rawYr = Number.parseInt(m2b[3], 10);
+    const mo = parseInt(m2b[1], 10);
+    const dy = parseInt(m2b[2], 10);
+    const rawYr = parseInt(m2b[3], 10);
     const yr = rawYr <= 30 ? 2000 + rawYr : 1900 + rawYr;
     if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
       dateStr = `${yr}-${m2b[1].padStart(2, '0')}-${m2b[2].padStart(2, '0')}`;
@@ -747,15 +802,14 @@ async function generateFilename(text, classification, description, ext) {
       slug = classification.type;
     }
   }
-  slug = slug
-    .trim()
+  slug = slug.trim()
     // Normalize OCR camelCase concatenation artifacts before splitting.
     // Pattern: two uppercase letters followed by a lowercase letter (e.g. "CCenter",
     // "SService") means a stray capital was merged with the next word. Insert a space
     // so "CCenter" → "C Center" and the single-char "C" gets filtered below.
     .replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')
     .split(/[\s\-_]+/)
-    .map((w) => {
+    .map(w => {
       // Strip leading/trailing non-alphanumeric chars before title-casing so that
       // tokens like "Inc." become "Inc" and "C." becomes "C" (then filtered below).
       // This prevents trailing punctuation from gluing adjacent tokens (e.g. "C.Center"
@@ -766,7 +820,7 @@ async function generateFilename(text, classification, description, ext) {
     })
     // Drop empty strings and single-character tokens — isolated letters are almost always
     // OCR noise (a stray "C" split off from "Center", an ampersand residue, etc.)
-    .filter((w) => w.length > 1)
+    .filter(w => w.length > 1)
     .join('_')
     .replace(/[^a-zA-Z0-9_]/g, '')
     .replace(/_+/g, '_')
@@ -785,60 +839,18 @@ async function generateFilename(text, classification, description, ext) {
 //       Pass "My Great Report\npage 1" → expect "My Great Report".
 //       Pass "99-AB-4422\nJohn Smith\n123 Main St" → expect "john-smith" (token fallback).
 function extractTitleSlug(text) {
-  const stopWords = new Set([
-    'the',
-    'a',
-    'an',
-    'of',
-    'and',
-    'or',
-    'in',
-    'to',
-    'for',
-    'is',
-    'are',
-    'was',
-    'were',
-    'with',
-    'from',
-    'by',
-    'at',
-    'on',
-    'this',
-    'that',
-    'these',
-    'those',
-    'it',
-    'its',
-    'be',
-    'been',
-    'has',
-    'have',
-    'had',
-    'not',
-    'but',
-    'as',
-    'if',
-    'so',
-    'do',
-    'did',
-    'will',
-    'would',
-    'could',
-    'should',
-  ]);
+  const stopWords = new Set(['the','a','an','of','and','or','in','to','for','is','are','was',
+    'were','with','from','by','at','on','this','that','these','those','it','its','be','been',
+    'has','have','had','not','but','as','if','so','do','did','will','would','could','should']);
 
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
 
   // Returns true when a line looks like noise rather than a document title.
   // Rejects lines that start with digits, contain @ or http, look like phone
   // numbers / form codes, are predominantly non-alpha characters, follow a
   // "Label: value" pattern, or consist mostly of digit-bearing tokens.
   function isNoiseLine(line) {
-    if (/^[\d]/.test(line)) return true; // starts with digit
+    if (/^[\d]/.test(line))          return true; // starts with digit
     if (/@|https?:\/\//i.test(line)) return true; // email / URL
     if (/^\d[\d\s\-().]{6,}$/.test(line)) return true; // phone-like
     // "Key: value" label lines (colon after 1-3 words) — not a document title.
@@ -846,37 +858,32 @@ function extractTitleSlug(text) {
     // Require at least 60 % of word characters to be alphabetic.
     const wordChars = line.replace(/[^a-zA-Z0-9]/g, '');
     if (wordChars.length === 0) return true;
-    const alphaRatio = line.replace(/[^a-zA-Z]/g, '').length / wordChars.length;
+    const alphaRatio = (line.replace(/[^a-zA-Z]/g, '').length) / wordChars.length;
     if (alphaRatio < 0.6) return true;
     // Reject lines where the majority of tokens contain a digit (e.g. "page 1 of 3").
-    const tokens = line.split(/\s+/).filter((t) => t.length > 0);
-    const digitTokens = tokens.filter((t) => /\d/.test(t)).length;
+    const tokens = line.split(/\s+/).filter(t => t.length > 0);
+    const digitTokens = tokens.filter(t => /\d/.test(t)).length;
     if (tokens.length > 0 && digitTokens / tokens.length > 0.4) return true;
     // Reject street address lines (e.g. "S Eastwood Drive", "1421 W Lake Shore Blvd")
-    const roadTypes =
-      /\b(street|st|avenue|ave|boulevard|blvd|drive|dr|road|rd|lane|ln|way|court|ct|place|pl|parkway|pkwy|circle|cir|trail|trl)\b/i;
+    const roadTypes = /\b(street|st|avenue|ave|boulevard|blvd|drive|dr|road|rd|lane|ln|way|court|ct|place|pl|parkway|pkwy|circle|cir|trail|trl)\b/i;
     const addressPrefixes = /^(north|south|east|west|n|s|e|w)\b/i;
     if (roadTypes.test(line) && (addressPrefixes.test(line) || /^\d/.test(line))) return true;
     // Reject common form-field label phrases
-    const formLabels =
-      /^(work\s+authorized|authorized\s+by|customer\s+signature|date\s+of\s+service|service\s+advisor|vehicle\s+in|vehicle\s+out|mileage\s+in|mileage\s+out|license\s+plate|vin\s+number|technician|print\s+name|signature)\b/i;
+    const formLabels = /^(work\s+authorized|authorized\s+by|customer\s+signature|date\s+of\s+service|service\s+advisor|vehicle\s+in|vehicle\s+out|mileage\s+in|mileage\s+out|license\s+plate|vin\s+number|technician|print\s+name|signature)\b/i;
     if (formLabels.test(line)) return true;
     return false;
   }
 
   function wordCount(line) {
-    return line.split(/\s+/).filter((w) => w.length > 0).length;
+    return line.split(/\s+/).filter(w => w.length > 0).length;
   }
 
   // Returns true when the majority of alphabetic words in a line are stop words,
   // indicating navigational/boilerplate text rather than a document title.
   function isStopWordHeavy(line) {
-    const words = line
-      .split(/\s+/)
-      .map((w) => w.toLowerCase().replace(/[^a-z]/g, ''))
-      .filter((w) => w.length > 0);
+    const words = line.split(/\s+/).map(w => w.toLowerCase().replace(/[^a-z]/g, '')).filter(w => w.length > 0);
     if (words.length === 0) return true;
-    const stopCount = words.filter((w) => stopWords.has(w)).length;
+    const stopCount = words.filter(w => stopWords.has(w)).length;
     return stopCount / words.length > 0.5;
   }
 
@@ -890,30 +897,23 @@ function extractTitleSlug(text) {
   // Test: Pass "ROCKET MORTGAGE\nAutopay Confirmation\nDear Customer" →
   //       expect "ROCKET MORTGAGE Autopay Confirmation".
   let companyLine = null;
-  let companyIdx = -1;
+  let companyIdx  = -1;
   for (let i = 0; i < Math.min(lines.length, 10); i++) {
     const line = lines[i];
-    const wc = wordCount(line);
-    if (
-      wc >= 1 &&
-      wc <= 4 &&
-      line === line.toUpperCase() &&
-      /[A-Z]/.test(line) &&
-      !isNoiseLine(line)
-    ) {
+    const wc   = wordCount(line);
+    if (wc >= 1 && wc <= 4 && line === line.toUpperCase() && /[A-Z]/.test(line) && !isNoiseLine(line)) {
       companyLine = line;
-      companyIdx = i;
+      companyIdx  = i;
       break;
     }
   }
   if (companyLine !== null) {
     for (let j = companyIdx + 1; j < Math.min(lines.length, companyIdx + 4); j++) {
       const next = lines[j];
-      const wc = wordCount(next);
+      const wc   = wordCount(next);
       if (
-        wc >= 1 &&
-        wc <= 5 &&
-        next !== next.toUpperCase() && // not another ALL-CAPS line
+        wc >= 1 && wc <= 5 &&
+        next !== next.toUpperCase() &&   // not another ALL-CAPS line
         !isNoiseLine(next) &&
         !isStopWordHeavy(next)
       ) {
@@ -927,14 +927,7 @@ function extractTitleSlug(text) {
   // Heuristic 1: ALL-CAPS line (1-6 words) in first 15 lines.
   for (const line of lines.slice(0, 15)) {
     const wc = wordCount(line);
-    if (
-      wc >= 1 &&
-      wc <= 6 &&
-      line === line.toUpperCase() &&
-      /[A-Z]/.test(line) &&
-      !isNoiseLine(line) &&
-      !isStopWordHeavy(line)
-    ) {
+    if (wc >= 1 && wc <= 6 && line === line.toUpperCase() && /[A-Z]/.test(line) && !isNoiseLine(line) && !isStopWordHeavy(line)) {
       return line;
     }
   }
@@ -948,10 +941,9 @@ function extractTitleSlug(text) {
   }
 
   // Heuristic 3: Fallback — first 5 non-stop-word tokens from the full text.
-  const tokens = text
-    .split(/\s+/)
-    .map((t) => t.toLowerCase().replace(/[^a-z0-9]/g, ''))
-    .filter((t) => t.length > 2 && !stopWords.has(t));
+  const tokens = text.split(/\s+/)
+    .map(t => t.toLowerCase().replace(/[^a-z0-9]/g, ''))
+    .filter(t => t.length > 2 && !stopWords.has(t));
   return tokens.slice(0, 5).join(' ') || '';
 }
 
@@ -985,19 +977,19 @@ async function clearStuckEsclJobs() {
 
     // Extract all JobUri values — these are the active/processing job URLs
     const jobUriMatches = xml.matchAll(/<(?:[^:>]+:)?JobUri>([^<]+)<\/(?:[^:>]+:)?JobUri>/g);
-    const jobUris = [...jobUriMatches].map((m) => m[1].trim());
+    const jobUris = [...jobUriMatches].map(m => m[1].trim());
     if (jobUris.length === 0) return;
 
     // DELETE each stuck job (fire-and-forget per job, but await all)
     await Promise.allSettled(
-      jobUris.map((uri) => {
+      jobUris.map(uri => {
         const url = uri.startsWith('http') ? uri : `${CANON_ESCL_BASE}${uri}`;
         return fetch(url, { method: 'DELETE', signal: AbortSignal.timeout(3000) });
       })
     );
 
     // Brief pause for the printer to release the job lock
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise(resolve => setTimeout(resolve, 500));
   } catch {
     // Non-fatal — proceed with the scan attempt
   }
@@ -1083,9 +1075,7 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution, onProgress) {
       // Discard blank pages — duplex scanning produces a back-side image for every sheet,
       // which is blank when the document is single-sided.
       if (pageData.length < BLANK_PAGE_THRESHOLD_BYTES) {
-        console.error(
-          `[scan] Discarding page ${pageNum} as blank (${pageData.length} bytes < ${BLANK_PAGE_THRESHOLD_BYTES} threshold)`
-        );
+        console.error(`[scan] Discarding page ${pageNum} as blank (${pageData.length} bytes < ${BLANK_PAGE_THRESHOLD_BYTES} threshold)`);
         fs.unlinkSync(pageFile);
         continue;
       }
@@ -1112,7 +1102,7 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution, onProgress) {
 //       Mock fetch to throw; mock CLI to succeed; assert method === "ocrmypdf-local".
 //       Mock all three to fail; assert the function throws.
 async function createSearchablePdfFromJpeg(jpegPath, outPath, language) {
-  const lang = language || 'eng';
+  const lang = language || "eng";
   // Attempt 1: remote polycr ocrmypdf service at port 8001
   // rotate-pages, deskew, and image-dpi 300 are applied server-side
   try {
@@ -1123,12 +1113,7 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath, language) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 60000);
     let pdfResp;
-    const pdfParams = new URLSearchParams({
-      deskew: 'true',
-      optimize: '1',
-      rotate_pages: 'true',
-      language: lang,
-    });
+    const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1', rotate_pages: 'true', language: lang });
     try {
       pdfResp = await fetch(`${POLYCR_PDF_URL}/pdf?${pdfParams}`, {
         method: 'POST',
@@ -1153,18 +1138,7 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath, language) {
   } catch (remoteErr) {
     // Attempt 2: local ocrmypdf CLI
     try {
-      await execFileAsync('ocrmypdf', [
-        '--rotate-pages',
-        '--deskew',
-        '--optimize',
-        '1',
-        '--image-dpi',
-        '300',
-        '--language',
-        lang,
-        jpegPath,
-        outPath,
-      ]);
+      await execFileAsync('ocrmypdf', ['--rotate-pages', '--deskew', '--optimize', '1', '--image-dpi', '300', '--language', lang, jpegPath, outPath]);
       return { path: outPath, method: 'ocrmypdf-local' };
     } catch (cliErr) {
       // Attempt 3: bare tesseract pdf mode as last resort
@@ -1175,8 +1149,8 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath, language) {
       } catch (tesseractErr) {
         throw new Error(
           `PDF creation failed — polycr service: ${remoteErr.message}; ` +
-            `ocrmypdf CLI: ${cliErr.message}; ` +
-            `tesseract: ${tesseractErr.message}`
+          `ocrmypdf CLI: ${cliErr.message}; ` +
+          `tesseract: ${tesseractErr.message}`
         );
       }
     }
@@ -1190,7 +1164,7 @@ async function createSearchablePdfFromJpeg(jpegPath, outPath, language) {
 async function nextcloudUpload(localPath, nextcloudPath, filename) {
   const fileBuffer = fs.readFileSync(localPath);
   const url = `${NEXTCLOUD_WEBDAV_BASE}${nextcloudPath}${encodeURIComponent(filename)}`;
-  const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
+  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
 
   // MKCOL is safe to call even when directory already exists (server returns 405).
   await fetch(`${NEXTCLOUD_WEBDAV_BASE}${nextcloudPath}`, {
@@ -1213,7 +1187,7 @@ async function nextcloudUpload(localPath, nextcloudPath, filename) {
 // What: HTTP GET via WebDAV, writes buffer to outputPath.
 async function nextcloudDownload(ncFullPath, outputPath) {
   const url = `${NEXTCLOUD_WEBDAV_BASE}${ncFullPath}`;
-  const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
+  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
   const resp = await fetch(url, { method: 'GET', headers: { Authorization: auth } });
   if (!resp.ok) throw new Error(`Nextcloud download failed: HTTP ${resp.status} for ${ncFullPath}`);
   fs.writeFileSync(outputPath, Buffer.from(await resp.arrayBuffer()));
@@ -1223,7 +1197,7 @@ async function nextcloudDownload(ncFullPath, outputPath) {
 // What: WebDAV DELETE — returns true on success, throws on unexpected error.
 async function nextcloudDelete(ncFullPath) {
   const url = `${NEXTCLOUD_WEBDAV_BASE}${ncFullPath}`;
-  const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
+  const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
   const resp = await fetch(url, { method: 'DELETE', headers: { Authorization: auth } });
   if (!resp.ok && resp.status !== 204 && resp.status !== 404) {
     throw new Error(`Nextcloud DELETE failed: HTTP ${resp.status}`);
@@ -1233,399 +1207,500 @@ async function nextcloudDelete(ncFullPath) {
 
 // --- end scan_and_file helpers ---
 
-const server = new Server({ name: 'ocr-mcp', version: '1.2.0' }, { capabilities: { tools: {} } });
+const server = new Server(
+  { name: "ocr-mcp", version: "1.2.0" },
+  { capabilities: { tools: {} } }
+);
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: 'ocr_image_local',
+      name: "ocr_image_local",
       description:
-        'Extract text from a local image file using Tesseract OCR. Returns JSON with text, word_count, and empty flag. Optionally preprocesses the image for better results.',
+        "Extract text from a local image file using Tesseract OCR. Returns JSON with text, word_count, and empty flag. Optionally preprocesses the image for better results.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           file_path: {
-            type: 'string',
-            description: 'Absolute path to the local image file',
+            type: "string",
+            description: "Absolute path to the local image file",
           },
           preprocess: {
-            type: 'boolean',
+            type: "boolean",
             description:
-              'If true, runs enhance_image_for_ocr first (grayscale + normalize + sharpen) before OCR. Default: false.',
+              "If true, runs enhance_image_for_ocr first (grayscale + normalize + sharpen) before OCR. Default: false.",
           },
         },
-        required: ['file_path'],
+        required: ["file_path"],
       },
     },
     {
-      name: 'ocr_image_polycr',
+      name: "ocr_image_polycr",
       description:
-        'Extract text from a local image using the polycr multi-engine OCR service with automatic fallback to local Tesseract. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.',
+        "Extract text from a local image using the polycr multi-engine OCR service with automatic fallback to local Tesseract. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           file_path: {
-            type: 'string',
-            description: 'Absolute path to the local image file',
+            type: "string",
+            description: "Absolute path to the local image file",
           },
         },
-        required: ['file_path'],
+        required: ["file_path"],
       },
     },
     {
-      name: 'extract_event_details',
+      name: "extract_event_details",
       description:
-        'OCR an image and classify the document type using keyword heuristics. Auto-orients the image first. Returns raw_text, engine_used, confidence, word_count, likely_document_type, and document_signals.',
+        "OCR an image and classify the document type using keyword heuristics. Auto-orients the image first. Returns raw_text, engine_used, confidence, word_count, likely_document_type, and document_signals.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           file_path: {
-            type: 'string',
-            description: 'Absolute path to the local image file',
+            type: "string",
+            description: "Absolute path to the local image file",
           },
         },
-        required: ['file_path'],
+        required: ["file_path"],
       },
     },
     {
-      name: 'ocr_image_from_base64',
+      name: "ocr_image_from_base64",
       description:
-        'Read a local image file, base64-encode it internally, and extract text using polycr with Tesseract fallback. Pass a local filesystem path (NOT raw base64) — the tool handles encoding so large image payloads never pass through the LLM. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.',
+        "Read a local image file, base64-encode it internally, and extract text using polycr with Tesseract fallback. Pass a local filesystem path (NOT raw base64) — the tool handles encoding so large image payloads never pass through the LLM. Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           file_path: {
-            type: 'string',
-            description: 'Absolute path to the local image file (jpg, png, gif, webp, tiff, bmp)',
+            type: "string",
+            description: "Absolute path to the local image file (jpg, png, gif, webp, tiff, bmp)",
           },
         },
-        required: ['file_path'],
+        required: ["file_path"],
       },
     },
     {
-      name: 'ocr_image_from_url',
+      name: "ocr_image_from_url",
       description:
-        'Download an image from a URL and extract text using polycr with Tesseract fallback. Enforces a 30s download timeout and a 20MB size limit. Optionally pass auth_header to send an Authorization header (e.g., for fetching images from authenticated routes). Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.',
+        "Download an image from a URL and extract text using polycr with Tesseract fallback. Enforces a 30s download timeout and a 20MB size limit. Optionally pass auth_header to send an Authorization header (e.g., for fetching images from authenticated routes). Returns JSON with text, engine_used, confidence, word_count, empty, and optional fallback_reason.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           url: {
-            type: 'string',
-            format: 'uri',
-            description: 'URL of the image to download and OCR',
+            type: "string",
+            format: "uri",
+            description: "URL of the image to download and OCR",
           },
           auth_header: {
-            type: 'string',
+            type: "string",
             description: "Optional Authorization header value (e.g., 'Bearer xyz')",
           },
         },
-        required: ['url'],
+        required: ["url"],
       },
     },
     {
-      name: 'rotate_image',
-      description: 'Rotate an image by a specified number of degrees using ImageMagick.',
+      name: "rotate_image",
+      description:
+        "Rotate an image by a specified number of degrees using ImageMagick.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           file_path: {
-            type: 'string',
-            description: 'Absolute path to the input image file',
+            type: "string",
+            description: "Absolute path to the input image file",
           },
           degrees: {
-            type: 'number',
+            type: "number",
             description:
-              'Degrees to rotate (e.g. 90, 180, 270, or any value). Positive = clockwise.',
+              "Degrees to rotate (e.g. 90, 180, 270, or any value). Positive = clockwise.",
           },
           output_path: {
-            type: 'string',
-            description: 'Optional output path. If omitted, overwrites the input file in place.',
+            type: "string",
+            description:
+              "Optional output path. If omitted, overwrites the input file in place.",
           },
         },
-        required: ['file_path', 'degrees'],
+        required: ["file_path", "degrees"],
       },
     },
     {
-      name: 'auto_orient_image',
-      description: 'Fix image orientation based on EXIF metadata using ImageMagick -auto-orient.',
+      name: "auto_orient_image",
+      description:
+        "Fix image orientation based on EXIF metadata using ImageMagick -auto-orient.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           file_path: {
-            type: 'string',
-            description: 'Absolute path to the input image file',
+            type: "string",
+            description: "Absolute path to the input image file",
           },
           output_path: {
-            type: 'string',
+            type: "string",
             description:
-              'Optional output path. Defaults to <basename>_processed.<ext> in the same directory.',
+              "Optional output path. Defaults to <basename>_processed.<ext> in the same directory.",
           },
         },
-        required: ['file_path'],
+        required: ["file_path"],
       },
     },
     {
-      name: 'enhance_image_for_ocr',
+      name: "enhance_image_for_ocr",
       description:
-        'Preprocess an image for better Tesseract OCR results: auto-orient, convert to grayscale, normalize contrast, and sharpen.',
+        "Preprocess an image for better Tesseract OCR results: auto-orient, convert to grayscale, normalize contrast, and sharpen.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           file_path: {
-            type: 'string',
-            description: 'Absolute path to the input image file',
+            type: "string",
+            description: "Absolute path to the input image file",
           },
           output_path: {
-            type: 'string',
+            type: "string",
             description:
-              'Optional output path. Defaults to <basename>_processed.<ext> in the same directory.',
+              "Optional output path. Defaults to <basename>_processed.<ext> in the same directory.",
           },
         },
-        required: ['file_path'],
+        required: ["file_path"],
       },
     },
     {
-      name: 'scan_document',
+      name: "scan_document",
       description:
-        'Scan a single page to a local file path using scanimage. Low-level tool — use scan_and_file instead for the full pipeline (OCR + PDF + Nextcloud). Returns success, path, scanner used.',
+        "Scan a single page to a local file path using scanimage. Low-level tool — use scan_and_file instead for the full pipeline (OCR + PDF + Nextcloud). Returns success, path, scanner used.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           output_path: {
-            type: 'string',
-            description: 'Output file path (e.g. /tmp/scan.jpg)',
+            type: "string",
+            description: "Output file path (e.g. /tmp/scan.jpg)",
           },
           resolution: {
-            type: 'number',
-            description: 'DPI resolution (default 300)',
+            type: "number",
+            description: "DPI resolution (default 300)",
           },
           mode: {
-            type: 'string',
-            enum: ['Color', 'Gray'],
-            description: 'Color or grayscale (default Color)',
+            type: "string",
+            enum: ["Color", "Gray"],
+            description: "Color or grayscale (default Color)",
           },
           source: {
-            type: 'string',
-            enum: ['Flatbed', 'ADF'],
-            description: 'Flatbed platen or ADF feeder (default Flatbed)',
+            type: "string",
+            enum: ["Flatbed", "ADF"],
+            description: "Flatbed platen or ADF feeder (default Flatbed)",
           },
           scanner: {
-            type: 'string',
-            enum: ['hp-officejet-5740', 'canon-mf741c'],
-            description:
-              'Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). hp-officejet-5740 = HP Officejet 5740 (backup flatbed). Default: canon-mf741c',
+            type: "string",
+            enum: ["hp-officejet-5740", "canon-mf741c"],
+            description: "Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). hp-officejet-5740 = HP Officejet 5740 (backup flatbed). Default: canon-mf741c",
           },
         },
-        required: ['output_path'],
+        required: ["output_path"],
       },
     },
     {
-      name: 'create_searchable_pdf',
+      name: "create_searchable_pdf",
       description:
-        'Convert an image (or existing PDF) into a searchable PDF with an embedded text layer by sending it to the ocrmypdf service on the polycr host (port 8001). Falls back to local `tesseract ... pdf` if the service is unreachable. Returns the output PDF path and file size.',
+        "Convert an image (or existing PDF) into a searchable PDF with an embedded text layer by sending it to the ocrmypdf service on the polycr host (port 8001). Falls back to local `tesseract ... pdf` if the service is unreachable. Returns the output PDF path and file size.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           image_path: {
-            type: 'string',
-            description: 'Absolute path to the input image or PDF file',
+            type: "string",
+            description: "Absolute path to the input image or PDF file",
           },
           output_path: {
-            type: 'string',
-            description: 'Absolute path for the output PDF. If omitted, defaults to <input-basename>.pdf in the input\'s directory.',
+            type: "string",
+            description: "Absolute path for the output PDF. If omitted, defaults to <input-basename>.pdf in the input's directory.",
           },
           deskew: {
-            type: 'boolean',
-            description: 'Deskew the input before OCR (default true)',
+            type: "boolean",
+            description: "Deskew the input before OCR (default true)",
           },
           optimize: {
-            type: 'number',
-            description: 'PDF optimization level 0–3 (default 1)',
+            type: "number",
+            description: "PDF optimization level 0–3 (default 1)",
           },
           image_dpi: {
-            type: 'integer',
-            description: 'DPI to assume for image inputs lacking embedded resolution metadata (default 300). Always forwarded to ocrmypdf for image inputs so stock JPEGs without DPI work out of the box.',
+            type: "integer",
+            description: "DPI to assume for image inputs lacking embedded resolution metadata (default 300). Always forwarded to ocrmypdf for image inputs so stock JPEGs without DPI work out of the box.",
           },
         },
-        required: ['image_path'],
+        required: ["image_path"],
       },
     },
     {
-      name: 'scan_and_file',
+      name: "scan_and_file",
       description:
-        'Scan a document and file it to Nextcloud automatically. Full pipeline: scan → OCR → searchable PDF → auto-classify → upload. Only `profile` is required; all other parameters have defaults. Default scanner is canon-mf741c. Returns filename, filed_at path, pdf_method, word_count, and confidence.',
+        "Start a scan job in the background. Returns a job_id immediately (NOT the final result). Full pipeline: scan → OCR → searchable PDF → auto-classify → upload. You MUST then poll get_scan_job_status with the returned job_id every 5-10 seconds until status is COMPLETED (typical: 90-180 seconds), then call get_scan_job_result to retrieve the filed document. Do NOT call this tool again before the previous scan completes — Canon scanner is a shared resource. Only `profile` is required; all other parameters have defaults.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           profile: {
-            type: 'string',
-            enum: ['doc-bw', 'doc-bw-adf', 'doc-color', 'receipt', 'id-card', 'photo', 'event'],
-            description:
-              'Scanning profile. doc-bw-adf = Canon ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
+            type: "string",
+            enum: ["doc-bw", "doc-bw-adf", "doc-color", "receipt", "id-card", "photo", "event"],
+            description: "Scanning profile. doc-bw-adf = Canon ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.",
           },
           description: {
-            type: 'string',
-            description:
-              "Optional hint for filename and classification (e.g. 'verizon bill april 2026', 'theodore immunization'). Improves auto-naming accuracy.",
+            type: "string",
+            description: "Optional hint for filename and classification (e.g. 'verizon bill april 2026', 'theodore immunization'). Improves auto-naming accuracy.",
           },
           nextcloud_path: {
-            type: 'string',
-            description:
-              'Override auto-classified Nextcloud path (e.g. /Personal/Legal/). Include trailing slash.',
+            type: "string",
+            description: "Override auto-classified Nextcloud path (e.g. /Personal/Legal/). Include trailing slash.",
           },
           filename: {
-            type: 'string',
-            description: 'Override auto-generated filename (e.g. 2026-04-13_verizon-bill.pdf)',
+            type: "string",
+            description: "Override auto-generated filename (e.g. 2026-04-13_verizon-bill.pdf)",
           },
           separate_pages: {
-            type: 'boolean',
-            description:
-              'ADF only: file each ADF page as a separate document. Default false (merge all pages into one PDF).',
+            type: "boolean",
+            description: "ADF only: file each ADF page as a separate document. Default false (merge all pages into one PDF).",
           },
           scanner: {
-            type: 'string',
-            enum: ['hp-officejet-5740', 'canon-mf741c'],
-            description:
-              'Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). hp-officejet-5740 = HP Officejet 5740 (backup flatbed). Default: canon-mf741c',
+            type: "string",
+            enum: ["hp-officejet-5740", "canon-mf741c"],
+            description: "Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). hp-officejet-5740 = HP Officejet 5740 (backup flatbed). Default: canon-mf741c",
           },
           language: {
-            type: 'string',
-            enum: ['eng', 'lav'],
-            description:
-              "OCR language for text recognition. 'eng' = English (default), 'lav' = Latvian. Threads through to Tesseract and ocrmypdf.",
+            type: "string",
+            enum: ["eng", "lav"],
+            description: "OCR language for text recognition. 'eng' = English (default), 'lav' = Latvian. Threads through to Tesseract and ocrmypdf.",
           },
         },
-        required: ['profile'],
+        required: ["profile"],
       },
     },
     {
-      name: 'quick_scan',
-      description:
-        'Scan whatever is in the Canon MF741C ADF. Returns an error if ADF is empty. Zero configuration needed — uses Canon MF741C + doc-bw-adf profile + auto-classification. Returns filed_at path and OCR preview.',
+      name: "quick_scan",
+      description: "Single-page quick scan using Canon MF741C ADF. Returns a job_id immediately (NOT the final result). Returns an error if ADF is empty. Zero configuration needed. Use the same polling pattern as scan_and_file: poll get_scan_job_status every 5-10 seconds until COMPLETED, then call get_scan_job_result.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           description: {
-            type: 'string',
+            type: "string",
             description: "Optional hint for filename (e.g. 'verizon bill')",
           },
         },
       },
     },
     {
-      name: 'nextcloud_move',
-      description:
-        'Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning, or to move a file into a different directory — cross-directory moves are fully supported (verified working in testing). source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/123-Sample-Dr/Mortage/old.pdf). Returns success and the new full URL.',
+      name: "scan_and_file_async",
+      description: "Alias for scan_and_file — both return a job_id immediately and require polling. Use scan_and_file as the canonical name. Start a scan-and-file job in the background. Returns a job_id immediately (within ~1s). Poll get_scan_job_status every 5-10s until COMPLETED, then call get_scan_job_result. Only one scan may run at a time.",
       inputSchema: {
-        type: 'object',
+        type: "object",
+        properties: {
+          profile: {
+            type: "string",
+            enum: ["doc-bw", "doc-bw-adf", "doc-color", "receipt", "id-card", "photo", "event"],
+            description: "Scanning profile. doc-bw-adf = Canon ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.",
+          },
+          description: {
+            type: "string",
+            description: "Optional hint for filename and classification (e.g. 'verizon bill april 2026'). Improves auto-naming accuracy.",
+          },
+          nextcloud_path: {
+            type: "string",
+            description: "Override auto-classified Nextcloud path (e.g. /Personal/Legal/). Include trailing slash.",
+          },
+          filename: {
+            type: "string",
+            description: "Override auto-generated filename (e.g. 2026-04-13_verizon-bill.pdf)",
+          },
+          separate_pages: {
+            type: "boolean",
+            description: "ADF only: file each ADF page as a separate document. Default false (merge all pages into one PDF).",
+          },
+          scanner: {
+            type: "string",
+            enum: ["hp-officejet-5740", "canon-mf741c"],
+            description: "Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). Default: canon-mf741c",
+          },
+          language: {
+            type: "string",
+            enum: ["eng", "lav"],
+            description: "OCR language. 'eng' = English (default), 'lav' = Latvian.",
+          },
+        },
+        required: ["profile"],
+      },
+    },
+    {
+      name: "get_scan_job_status",
+      description: "Poll the status of a background scan job. Returns status (PENDING|RUNNING|COMPLETED|FAILED|CANCELLED) and progress info. Call this every 5-10 seconds after starting a scan with scan_and_file or quick_scan until status is COMPLETED, then call get_scan_job_result. PENDING and RUNNING are normal — keep polling, do not give up.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          job_id: {
+            type: "string",
+            description: "Job ID returned by scan_and_file or quick_scan (e.g. 'scan_<uuid>')",
+          },
+        },
+        required: ["job_id"],
+      },
+    },
+    {
+      name: "get_scan_job_result",
+      description: "Retrieve the final result of a COMPLETED scan job (filed_at path, page count, OCR preview, etc.). Returns an error if the job is still PENDING or RUNNING — keep polling get_scan_job_status first. Also returns an error if the job FAILED.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          job_id: {
+            type: "string",
+            description: "Job ID returned by scan_and_file or quick_scan",
+          },
+        },
+        required: ["job_id"],
+      },
+    },
+    {
+      name: "cancel_scan_job",
+      description: "Best-effort cancel a pending or running scan job. The Canon scanner hardware job may not be interruptible mid-page; the job status is updated to CANCELLED immediately but the underlying scan may complete in the background.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          job_id: {
+            type: "string",
+            description: "Job ID returned by scan_and_file or quick_scan",
+          },
+        },
+        required: ["job_id"],
+      },
+    },
+    {
+      name: "nextcloud_move",
+      description: "Move or rename a file already in Nextcloud using WebDAV MOVE. Use this to rename a badly-named scan without re-scanning, or to move a file into a different directory — cross-directory moves are fully supported (verified working in testing). source_path and dest_path are full paths relative to the user root (e.g. /Personal/Housing/123-Sample-Dr/Mortage/old.pdf). Returns success and the new full URL.",
+      inputSchema: {
+        type: "object",
         properties: {
           source_path: {
-            type: 'string',
-            description:
-              'Current full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_bad-name.pdf)',
+            type: "string",
+            description: "Current full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_bad-name.pdf)",
           },
           dest_path: {
-            type: 'string',
-            description:
-              'New full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_rocket-mortgage.pdf). May be in a different folder than source_path — cross-directory moves are fully supported.',
+            type: "string",
+            description: "New full path in Nextcloud (e.g. /Personal/Housing/123-Sample-Dr/Mortage/2025-11-15_rocket-mortgage.pdf). May be in a different folder than source_path — cross-directory moves are fully supported.",
           },
         },
-        required: ['source_path', 'dest_path'],
+        required: ["source_path", "dest_path"],
       },
     },
     {
-      name: 'split_and_refile',
-      description:
-        'Split an already-filed multi-page PDF in Nextcloud into individual pages, OCR and classify each page, and refile them as separate documents. Use this when a batch ADF scan was merged into one PDF but the pages should have been filed individually. Returns an array of per-page results.',
+      name: "split_and_refile",
+      description: "Split an already-filed multi-page PDF in Nextcloud into individual pages, OCR and classify each page, and refile them as separate documents. Use this when a batch ADF scan was merged into one PDF but the pages should have been filed individually. Returns an array of per-page results.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           source_path: {
-            type: 'string',
-            description:
-              'Full Nextcloud path of the PDF to split, including filename. Example: /Personal/Auto/Subaru Outback/2026-04-19_Decraenes_Service_Center_Inc.pdf',
+            type: "string",
+            description: "Full Nextcloud path of the PDF to split, including filename. Example: /Personal/Auto/Subaru Outback/2026-04-19_Decraenes_Service_Center_Inc.pdf",
           },
           delete_original: {
-            type: 'boolean',
-            description:
-              'Delete the original merged PDF from Nextcloud after all pages are successfully refiled. Default: false. Only deletes if every page succeeded.',
+            type: "boolean",
+            description: "Delete the original merged PDF from Nextcloud after all pages are successfully refiled. Default: false. Only deletes if every page succeeded.",
           },
           description: {
-            type: 'string',
-            description:
-              "Optional hint for classification and filename generation, applied to every page (e.g. 'DeCraenes invoice').",
+            type: "string",
+            description: "Optional hint for classification and filename generation, applied to every page (e.g. 'DeCraenes invoice').",
           },
         },
-        required: ['source_path'],
+        required: ["source_path"],
       },
     },
     {
-      name: 'ocr_inbound_media',
-      description:
-        "OCR an image that was attached via the OpenClaw web GUI. When a user attaches a photo or image in the chat, it lands in the media/inbound directory. Call this tool immediately — do not try to use vision. Pass the media_id extracted from the '[media attached: media://inbound/<id>]' marker in the message, or omit it to use the most recently uploaded file. Returns OCR text, engine used, confidence, and word count.",
+      name: "ocr_inbound_media",
+      description: "OCR an image that was attached via the OpenClaw web GUI. When a user attaches a photo or image in the chat, it lands in the media/inbound directory. Call this tool immediately — do not try to use vision. Pass the media_id extracted from the '[media attached: media://inbound/<id>]' marker in the message, or omit it to use the most recently uploaded file. Returns OCR text, engine used, confidence, and word count.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           media_id: {
-            type: 'string',
-            description:
-              "The ID from 'media://inbound/<id>' in the message text. If omitted, uses the most recently modified file in the inbound directory.",
+            type: "string",
+            description: "The ID from 'media://inbound/<id>' in the message text. If omitted, uses the most recently modified file in the inbound directory.",
           },
           file_nextcloud: {
-            type: 'boolean',
-            description:
-              'If true, also create a searchable PDF and file to Nextcloud using auto-classification. Default false.',
+            type: "boolean",
+            description: "If true, also create a searchable PDF and file to Nextcloud using auto-classification. Default false.",
           },
           description: {
-            type: 'string',
-            description: 'Optional hint for classification and filename if file_nextcloud is true.',
+            type: "string",
+            description: "Optional hint for classification and filename if file_nextcloud is true.",
           },
         },
       },
     },
     {
-      name: 'fetch_url_as_base64',
+      name: "fetch_url_as_base64",
       description:
-        'Fetch a URL and return its body as base64. Supports optional Authorization header, HTTP method (default GET), and request body. Returns base64 string + content-type.',
+        "Fetch a URL and return its body as base64. Supports optional Authorization header, HTTP method (default GET), and request body. Returns base64 string + content-type.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
-          url: { type: 'string', format: 'uri' },
+          url: { type: "string", format: "uri" },
           auth_header: {
-            type: 'string',
+            type: "string",
             description: "Optional Authorization header value (e.g., 'Bearer xyz')",
           },
           method: {
-            type: 'string',
-            enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-            default: 'GET',
+            type: "string",
+            enum: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+            default: "GET",
           },
           body: {
-            type: 'string',
-            description: 'Optional request body (will be sent as Content-Type: application/json)',
+            type: "string",
+            description: "Optional request body (will be sent as Content-Type: application/json)",
           },
           max_bytes: {
-            type: 'integer',
+            type: "integer",
             default: 26214400,
-            description: 'Maximum response size in bytes (default 25MB)',
+            description: "Maximum response size in bytes (default 25MB)",
           },
         },
-        required: ['url'],
+        required: ["url"],
       },
     },
     {
-      name: 'detect_document_bbox',
+      name: "detect_document_bbox",
       description:
         "Detect a receipt/document's bounding box in an image using polycr's /detect endpoint (PaddleOCR text-region convex hull, padded 8%). Returns axis-aligned bounding box with 4 corner points suitable for cropping. Useful for receipts-web auto-crop preview.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
           file_path: {
-            type: 'string',
-            description: 'Absolute path to the image file',
+            type: "string",
+            description: "Absolute path to the image file",
           },
         },
-        required: ['file_path'],
+        required: ["file_path"],
+      },
+    },
+    {
+      name: "pdf_text_extract",
+      description:
+        "Extract text from a PDF that already has a selectable text layer (Tagged PDFs, digitally-created PDFs) using pdftotext. This is the fastest path for non-scanned PDFs — it avoids OCR entirely. Returns JSON with text, word_count, empty, and pages. Falls back gracefully with an error message if pdftotext is unavailable or the PDF has no text layer (word_count will be 0 in that case — caller should then use OCR tools).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file_path: {
+            type: "string",
+            description: "Absolute path to the local PDF file",
+          },
+        },
+        required: ["file_path"],
+      },
+    },
+    {
+      name: "polycr_process_pdf",
+      description:
+        "Send a local PDF or image file to the POLYCR /process endpoint (the same backend used by Open WebUI's external document loader). Works for both Tagged PDFs (text extraction) and scanned/image PDFs (OCR). Returns JSON with page_content (extracted text) and metadata. Preferred for PDF extraction when you want the POLYCR backend to decide the best strategy.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file_path: {
+            type: "string",
+            description: "Absolute path to the local PDF or image file",
+          },
+        },
+        required: ["file_path"],
       },
     },
   ],
@@ -1661,18 +1736,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
   }
 
-  if (name === 'ocr_image_local') {
+  if (name === "ocr_image_local") {
     const { file_path, preprocess = false } = args;
 
-    if (!file_path || typeof file_path !== 'string') {
-      throw new Error('file_path must be a non-empty string');
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
     }
 
     let targetPath = file_path;
     let tempFile = null;
 
     if (preprocess) {
-      const ext = path.extname(file_path) || '.jpg';
+      const ext = path.extname(file_path) || ".jpg";
       tempFile = path.join(os.tmpdir(), `ocr_preprocess_${Date.now()}${ext}`);
       try {
         execSync(
@@ -1685,12 +1760,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
 
     try {
-      const { stdout } = await execFileAsync('tesseract', [targetPath, 'stdout', '-l', 'eng']);
+      const { stdout } = await execFileAsync("tesseract", [
+        targetPath,
+        "stdout",
+        "-l",
+        "eng",
+      ]);
       const wc = countWords(stdout);
       return {
         content: [
           {
-            type: 'text',
+            type: "text",
             text: JSON.stringify({ text: stdout, word_count: wc, empty: wc === 0 }),
           },
         ],
@@ -1702,11 +1782,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
   }
 
-  if (name === 'ocr_image_polycr') {
+  if (name === "ocr_image_polycr") {
     const { file_path } = args;
 
-    if (!file_path || typeof file_path !== 'string') {
-      throw new Error('file_path must be a non-empty string');
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
     }
     if (!fs.existsSync(file_path)) {
       throw new Error(`File not found: ${file_path}`);
@@ -1724,31 +1804,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       output.fallback_reason = result.fallback_reason;
     }
     return {
-      content: [{ type: 'text', text: JSON.stringify(output) }],
+      content: [{ type: "text", text: JSON.stringify(output) }],
     };
   }
 
-  if (name === 'extract_event_details') {
+  if (name === "extract_event_details") {
     const { file_path } = args;
 
-    if (!file_path || typeof file_path !== 'string') {
-      throw new Error('file_path must be a non-empty string');
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
     }
     if (!fs.existsSync(file_path)) {
       throw new Error(`File not found: ${file_path}`);
     }
 
-    const ext = path.extname(file_path) || '.jpg';
-    const tempFile = path.join(os.tmpdir(), `event_orient_${Date.now()}${ext}`);
+    const ext = path.extname(file_path) || ".jpg";
+    const tempFile = path.join(
+      os.tmpdir(),
+      `event_orient_${Date.now()}${ext}`
+    );
 
     try {
       try {
-        execSync(`convert -auto-orient ${JSON.stringify(file_path)} ${JSON.stringify(tempFile)}`);
+        execSync(
+          `convert -auto-orient ${JSON.stringify(file_path)} ${JSON.stringify(tempFile)}`
+        );
       } catch (e) {
         throw new Error(`ImageMagick failed: ${e.message}`);
       }
       const ocrResult = await ocrWithFallback(tempFile);
-      const { likely_document_type, document_signals } = classifyDocument(ocrResult.text);
+      const { likely_document_type, document_signals } = classifyDocument(
+        ocrResult.text
+      );
       const output = {
         raw_text: ocrResult.text,
         engine_used: ocrResult.engine_used,
@@ -1758,7 +1845,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         document_signals,
       };
       return {
-        content: [{ type: 'text', text: JSON.stringify(output) }],
+        content: [{ type: "text", text: JSON.stringify(output) }],
       };
     } finally {
       if (fs.existsSync(tempFile)) {
@@ -1767,7 +1854,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
   }
 
-  if (name === 'ocr_image_from_base64') {
+  if (name === "ocr_image_from_base64") {
     // Why: The LLM must not emit raw base64 — large image strings overflow the output
     //      token limit and corrupt the tool-call args, crashing the hermes gateway.
     //      Accepting a file path keeps the LLM interaction small while still exercising
@@ -1777,38 +1864,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     //       file is removed afterward.
     const { file_path } = args;
 
-    if (!file_path || typeof file_path !== 'string') {
-      throw new Error('file_path must be a non-empty string');
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
     }
     if (!fs.existsSync(file_path)) {
       throw new Error(`File not found: ${file_path}`);
     }
 
     const allowedExts = {
-      '.jpg': '.jpg',
-      '.jpeg': '.jpg',
-      '.png': '.png',
-      '.gif': '.gif',
-      '.webp': '.webp',
-      '.tiff': '.tiff',
-      '.tif': '.tiff',
-      '.bmp': '.bmp',
+      ".jpg": ".jpg",
+      ".jpeg": ".jpg",
+      ".png": ".png",
+      ".gif": ".gif",
+      ".webp": ".webp",
+      ".tiff": ".tiff",
+      ".tif": ".tiff",
+      ".bmp": ".bmp",
     };
     const inExt = path.extname(file_path).toLowerCase();
     const ext = allowedExts[inExt];
     if (!ext) {
       throw new Error(
-        `Unsupported image extension '${inExt}'. Must be one of: ${[...new Set(Object.keys(allowedExts))].join(', ')}`
+        `Unsupported image extension '${inExt}'. Must be one of: ${[...new Set(Object.keys(allowedExts))].join(", ")}`
       );
     }
 
     // Encode to base64 internally, then decode to a temp file — keeps the base64 code
     // path exercised without ever routing the raw string through the LLM.
-    const b64Str = fs.readFileSync(file_path).toString('base64');
+    const b64Str = fs.readFileSync(file_path).toString("base64");
     const tempFile = path.join(os.tmpdir(), `ocr_b64_${Date.now()}${ext}`);
 
     try {
-      fs.writeFileSync(tempFile, Buffer.from(b64Str, 'base64'));
+      fs.writeFileSync(tempFile, Buffer.from(b64Str, "base64"));
       const result = await ocrWithFallback(tempFile);
       const output = {
         text: result.text,
@@ -1821,7 +1908,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         output.fallback_reason = result.fallback_reason;
       }
       return {
-        content: [{ type: 'text', text: JSON.stringify(output) }],
+        content: [{ type: "text", text: JSON.stringify(output) }],
       };
     } finally {
       if (fs.existsSync(tempFile)) {
@@ -1830,11 +1917,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
   }
 
-  if (name === 'ocr_image_from_url') {
+  if (name === "ocr_image_from_url") {
     const { url, auth_header } = args;
 
-    if (!url || typeof url !== 'string') {
-      throw new Error('url must be a non-empty string');
+    if (!url || typeof url !== "string") {
+      throw new Error("url must be a non-empty string");
     }
 
     const ac = new AbortController();
@@ -1842,15 +1929,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const timer = setTimeout(() => ac.abort(), 60000);
     let tempFile = null;
     // Send a progress ping every 20s so the MCP SDK client resets its 60s timeout window
-    const pingInterval = setInterval(
-      () => sendProgress(1, -1, 'ocr_image_from_url: working…'),
-      20000
-    );
+    const pingInterval = setInterval(() => sendProgress(1, -1, 'ocr_image_from_url: working…'), 20000);
 
     try {
       const headers = {};
-      if (auth_header && typeof auth_header === 'string') {
-        headers.Authorization = auth_header;
+      if (auth_header && typeof auth_header === "string") {
+        headers["Authorization"] = auth_header;
       }
       const resp = await fetch(url, { signal: ac.signal, headers });
       clearTimeout(timer);
@@ -1859,21 +1943,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         throw new Error(`Failed to download image: HTTP ${resp.status}`);
       }
 
-      const contentType = resp.headers.get('content-type') || '';
-      if (!contentType.startsWith('image/')) {
-        throw new Error(`URL does not point to an image (Content-Type: ${contentType})`);
+      const contentType = resp.headers.get("content-type") || "";
+      if (!contentType.startsWith("image/")) {
+        throw new Error(
+          `URL does not point to an image (Content-Type: ${contentType})`
+        );
       }
 
       const extFromMime = {
-        'image/jpeg': '.jpg',
-        'image/png': '.png',
-        'image/gif': '.gif',
-        'image/webp': '.webp',
-        'image/tiff': '.tiff',
-        'image/bmp': '.bmp',
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/tiff": ".tiff",
+        "image/bmp": ".bmp",
       };
-      const mimeBase = contentType.split(';')[0].trim();
-      const ext = extFromMime[mimeBase] || '.jpg';
+      const mimeBase = contentType.split(";")[0].trim();
+      const ext = extFromMime[mimeBase] || ".jpg";
       tempFile = path.join(os.tmpdir(), `ocr_url_${Date.now()}${ext}`);
 
       const MAX_BYTES = 20 * 1024 * 1024;
@@ -1883,7 +1969,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       for await (const chunk of resp.body) {
         totalBytes += chunk.length;
         if (totalBytes > MAX_BYTES) {
-          throw new Error('Image exceeds 20MB size limit');
+          throw new Error("Image exceeds 20MB size limit");
         }
         chunks.push(chunk);
       }
@@ -1902,7 +1988,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         output.fallback_reason = result.fallback_reason;
       }
       return {
-        content: [{ type: 'text', text: JSON.stringify(output) }],
+        content: [{ type: "text", text: JSON.stringify(output) }],
       };
     } catch (err) {
       clearTimeout(timer);
@@ -1915,14 +2001,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
   }
 
-  if (name === 'rotate_image') {
+  if (name === "rotate_image") {
     const { file_path, degrees, output_path } = args;
 
-    if (!file_path || typeof file_path !== 'string') {
-      throw new Error('file_path must be a non-empty string');
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
     }
-    if (typeof degrees !== 'number') {
-      throw new Error('degrees must be a number');
+    if (typeof degrees !== "number") {
+      throw new Error("degrees must be a number");
     }
 
     let outPath;
@@ -1935,10 +2021,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
 
     if (useTmp) {
-      const ext = path.extname(file_path) || '.jpg';
+      const ext = path.extname(file_path) || ".jpg";
       const tmp = path.join(os.tmpdir(), `rotate_tmp_${Date.now()}${ext}`);
       try {
-        execSync(`convert -rotate ${degrees} ${JSON.stringify(file_path)} ${JSON.stringify(tmp)}`);
+        execSync(
+          `convert -rotate ${degrees} ${JSON.stringify(file_path)} ${JSON.stringify(tmp)}`
+        );
       } catch (e) {
         throw new Error(`ImageMagick failed: ${e.message}`);
       }
@@ -1955,34 +2043,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
 
     return {
-      content: [{ type: 'text', text: outPath }],
+      content: [{ type: "text", text: outPath }],
     };
   }
 
-  if (name === 'auto_orient_image') {
+  if (name === "auto_orient_image") {
     const { file_path, output_path } = args;
 
-    if (!file_path || typeof file_path !== 'string') {
-      throw new Error('file_path must be a non-empty string');
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
     }
 
     const outPath = output_path || defaultOutputPath(file_path);
     try {
-      execSync(`convert -auto-orient ${JSON.stringify(file_path)} ${JSON.stringify(outPath)}`);
+      execSync(
+        `convert -auto-orient ${JSON.stringify(file_path)} ${JSON.stringify(outPath)}`
+      );
     } catch (e) {
       throw new Error(`ImageMagick failed: ${e.message}`);
     }
 
     return {
-      content: [{ type: 'text', text: outPath }],
+      content: [{ type: "text", text: outPath }],
     };
   }
 
-  if (name === 'enhance_image_for_ocr') {
+  if (name === "enhance_image_for_ocr") {
     const { file_path, output_path } = args;
 
-    if (!file_path || typeof file_path !== 'string') {
-      throw new Error('file_path must be a non-empty string');
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
     }
 
     const outPath = output_path || defaultOutputPath(file_path);
@@ -1995,35 +2085,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
 
     return {
-      content: [{ type: 'text', text: outPath }],
+      content: [{ type: "text", text: outPath }],
     };
   }
 
-  if (name === 'scan_document') {
+  if (name === "scan_document") {
     const {
       output_path,
       resolution = 300,
-      mode = 'Color',
-      source = 'Flatbed',
+      mode = "Color",
+      source = "Flatbed",
       scanner = 'canon-mf741c',
     } = args;
     const deviceName = SCANNERS[scanner] || DEFAULT_SCANNER;
 
-    if (!output_path || typeof output_path !== 'string') {
-      throw new Error('output_path must be a non-empty string');
+    if (!output_path || typeof output_path !== "string") {
+      throw new Error("output_path must be a non-empty string");
     }
 
     // Infer scanimage format from file extension
     const ext = path.extname(output_path).toLowerCase();
     let format;
-    if (ext === '.jpg' || ext === '.jpeg') {
-      format = 'jpeg';
-    } else if (ext === '.pdf') {
-      format = 'pdf';
-    } else if (ext === '.png') {
-      format = 'png';
+    if (ext === ".jpg" || ext === ".jpeg") {
+      format = "jpeg";
+    } else if (ext === ".pdf") {
+      format = "pdf";
+    } else if (ext === ".png") {
+      format = "png";
     } else {
-      format = 'jpeg';
+      format = "jpeg";
     }
 
     try {
@@ -2035,7 +2125,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       return {
         content: [
           {
-            type: 'text',
+            type: "text",
             text: JSON.stringify({ success: false, error: e.message }),
           },
         ],
@@ -2045,7 +2135,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     return {
       content: [
         {
-          type: 'text',
+          type: "text",
           text: JSON.stringify({
             success: true,
             path: output_path,
@@ -2059,7 +2149,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     };
   }
 
-  if (name === 'create_searchable_pdf') {
+  if (name === "create_searchable_pdf") {
     // Why: Produces an archival searchable PDF by delegating to the ocrmypdf service
     //      running alongside polycr, with a local Tesseract fallback for resilience.
     // What: POSTs the file to POLYCR_PDF_URL/pdf, saves the returned PDF next to the
@@ -2069,8 +2159,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     //       Mock fetch to throw; assert fallback_reason is set and pdf_path still exists.
     const { image_path, output_path, deskew = true, optimize = 1, image_dpi = 300 } = args;
 
-    if (!image_path || typeof image_path !== 'string') {
-      throw new Error('image_path must be a non-empty string');
+    if (!image_path || typeof image_path !== "string") {
+      throw new Error("image_path must be a non-empty string");
     }
     if (!fs.existsSync(image_path)) {
       throw new Error(`File not found: ${image_path}`);
@@ -2080,40 +2170,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const stem = path.basename(image_path, path.extname(image_path));
     // Honor the caller-supplied output_path; only derive a default from the input
     // basename when none is provided. (Bug: output_path was previously ignored.)
-    const pdfPath = (output_path && typeof output_path === 'string')
+    const pdfPath = (output_path && typeof output_path === "string")
       ? output_path
       : path.join(dir, `${stem}.pdf`);
 
-    const ext = path.extname(image_path).slice(1).toLowerCase() || 'jpg';
+    const ext = path.extname(image_path).slice(1).toLowerCase() || "jpg";
     // Image inputs lack DPI metadata when created without -density; ocrmypdf requires
     // an explicit --image-dpi for those. PDFs carry their own resolution, so DPI only
     // applies to non-PDF (image) inputs.
-    const isImageInput = ext !== 'pdf';
+    const isImageInput = ext !== "pdf";
 
     // Attempt remote ocrmypdf service first
     try {
       const fileBytes = fs.readFileSync(image_path);
       const mimeMap = {
-        jpg: 'image/jpeg',
-        jpeg: 'image/jpeg',
-        png: 'image/png',
-        gif: 'image/gif',
-        webp: 'image/webp',
-        tiff: 'image/tiff',
-        bmp: 'image/bmp',
-        pdf: 'application/pdf',
+        jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+        gif: "image/gif", webp: "image/webp", tiff: "image/tiff",
+        bmp: "image/bmp", pdf: "application/pdf",
       };
-      const mime = mimeMap[ext] || 'application/octet-stream';
+      const mime = mimeMap[ext] || "application/octet-stream";
       const blob = new Blob([fileBytes], { type: mime });
       const form = new FormData();
-      form.append('file', blob, path.basename(image_path));
+      form.append("file", blob, path.basename(image_path));
 
       const params = new URLSearchParams({
         deskew: String(deskew),
         optimize: String(optimize),
         rotate_pages: 'true',
-        ...(isImageInput ? { image_dpi: String(image_dpi) } : {}),
       });
+      // Always send image_dpi for image inputs so stock JPEGs without embedded DPI
+      // metadata don't fail with "Input file is an image but has no resolution (DPI)".
+      if (isImageInput) {
+        params.set('image_dpi', String(image_dpi));
+      }
 
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), 60000);
@@ -2121,7 +2210,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       let resp;
       try {
         resp = await fetch(`${POLYCR_PDF_URL}/pdf?${params}`, {
-          method: 'POST',
+          method: "POST",
           body: form,
           signal: ac.signal,
         });
@@ -2130,7 +2219,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       }
 
       if (!resp.ok) {
-        const errBody = await resp.text().catch(() => '');
+        const errBody = await resp.text().catch(() => "");
         throw new Error(`ocrmypdf service HTTP ${resp.status}: ${errBody}`);
       }
 
@@ -2140,69 +2229,74 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       return {
         content: [
           {
-            type: 'text',
+            type: "text",
             text: JSON.stringify({ pdf_path: pdfPath, size_bytes: pdfBuffer.length }),
           },
         ],
       };
     } catch (remoteErr) {
       // Fallback: run tesseract locally to produce a PDF
-      const fallbackReason =
-        remoteErr.name === 'AbortError'
-          ? 'ocrmypdf service timeout (60s)'
-          : `ocrmypdf service unreachable: ${remoteErr.message}`;
+      const fallbackReason = remoteErr.name === "AbortError"
+        ? "ocrmypdf service timeout (60s)"
+        : `ocrmypdf service unreachable: ${remoteErr.message}`;
 
       try {
-        const outStem = path.join(dir, stem);
-        await execFileAsync('tesseract', [image_path, outStem, 'pdf']);
+        // Local ocrmypdf CLI fallback — forward --image-dpi for image inputs so stock
+        // JPEGs without DPI metadata succeed, and write directly to the requested pdfPath.
+        const ocrmypdfArgs = ['--rotate-pages', '--optimize', String(optimize)];
+        if (deskew) ocrmypdfArgs.push('--deskew');
+        if (isImageInput) ocrmypdfArgs.push('--image-dpi', String(image_dpi));
+        ocrmypdfArgs.push(image_path, pdfPath);
+        await execFileAsync("ocrmypdf", ocrmypdfArgs);
         const size = fs.statSync(pdfPath).size;
         return {
           content: [
             {
-              type: 'text',
-              text: JSON.stringify({
-                pdf_path: pdfPath,
-                size_bytes: size,
-                fallback_reason: fallbackReason,
-              }),
+              type: "text",
+              text: JSON.stringify({ pdf_path: pdfPath, size_bytes: size, fallback_reason: fallbackReason }),
             },
           ],
         };
       } catch (localErr) {
-        throw new Error(
-          `ocrmypdf service failed (${fallbackReason}) and local tesseract fallback also failed: ${localErr.message}`
-        );
+        // Last resort: bare tesseract pdf mode. tesseract appends ".pdf" to the stem,
+        // so derive the stem from pdfPath to honor the requested output location.
+        try {
+          const outStem = pdfPath.replace(/\.pdf$/i, "");
+          await execFileAsync("tesseract", [image_path, outStem, "pdf"]);
+          const size = fs.statSync(pdfPath).size;
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ pdf_path: pdfPath, size_bytes: size, fallback_reason: fallbackReason }),
+              },
+            ],
+          };
+        } catch (tesseractErr) {
+          throw new Error(
+            `ocrmypdf service failed (${fallbackReason}), local ocrmypdf failed (${localErr.message}), and tesseract fallback also failed: ${tesseractErr.message}`
+          );
+        }
       }
     }
   }
 
-  if (name === 'scan_and_file' || name === 'quick_scan') {
+  if (name === "scan_and_file" || name === "quick_scan" || name === "scan_and_file_async") {
     // Why: Executes the full scan→OCR→PDF→upload pipeline atomically so a context
     //      bootstrap reset cannot interrupt it between steps.
     // What: Scans via scanimage, OCRs via polycr (Tesseract fallback), creates a
     //       searchable PDF via ocrmypdf service (Tesseract fallback), uploads to
     //       Nextcloud WebDAV, cleans up temp files, returns a summary object.
     //       quick_scan is a zero-config alias: canon-mf741c + doc-bw-adf defaults.
+    //       scan_and_file_async runs the same pipeline in the background, returning a
+    //       job_id immediately. Poll with get_scan_job_status / get_scan_job_result.
     // Test: Mock execSync for scanimage success; mock fetch for polycr and ocrmypdf;
     //       assert result.success is true, result.filed_at is non-null, and temp
     //       files are deleted by the end of the call.
-    const resolvedArgs =
-      name === 'quick_scan'
-        ? {
-            profile: 'doc-bw-adf',
-            scanner: 'canon-mf741c',
-            ...(args.description ? { description: args.description } : {}),
-          }
-        : args;
-    const {
-      profile,
-      description,
-      nextcloud_path: ncPathOverride,
-      filename: filenameOverride,
-      separate_pages = false,
-      scanner = 'canon-mf741c',
-      language,
-    } = resolvedArgs;
+    const resolvedArgs = name === "quick_scan"
+      ? { profile: 'doc-bw-adf', scanner: 'canon-mf741c', ...(args.description ? { description: args.description } : {}) }
+      : args;
+    const { profile, description, nextcloud_path: ncPathOverride, filename: filenameOverride, separate_pages = false, scanner = 'canon-mf741c', language } = resolvedArgs;
     const deviceName = SCANNERS[scanner] || DEFAULT_SCANNER;
     const params = PROFILE_PARAMS[profile];
     if (!params) throw new Error(`Unknown profile: ${profile}`);
@@ -2224,6 +2318,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     //      append _p2, _p3 suffixes before the extension.
     const usedFilenames = new Set();
 
+    // runScan: executes the full pipeline and returns the result payload (not the MCP
+    // envelope). Called directly (awaited) for sync tools; called fire-and-forget for
+    // scan_and_file_async. jobId is provided only for the async path — progress updates
+    // are written to both the MCP notification stream and the job state map.
+    async function runScan(jobId) {
+
     /**
      * Why: Encapsulates the OCR→classify→PDF→upload pipeline for a single page
      *      so it can be called in a loop for ADF or once for Flatbed.
@@ -2231,7 +2331,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
      *       and returns the flat result object.
      * Test: Pass a known JPEG path with mocked ocrWithFallback; assert result.success.
      */
-    async function processSinglePage(tmpJpeg, tmpPdf, _pageLabel) {
+    async function processSinglePage(tmpJpeg, tmpPdf, pageLabel) {
       // Step 2: OCR (skip for photo profile)
       let ocrText = '';
       let wordCount = 0;
@@ -2252,10 +2352,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           const enhanced = tmpJpeg.replace('.jpg', '_enhanced.jpg');
           allTempFiles.push(enhanced);
           try {
-            execSync(
-              `convert ${JSON.stringify(tmpJpeg)} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`,
-              { timeout: 30000 }
-            );
+            execSync(`convert ${JSON.stringify(tmpJpeg)} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
             const enhancedResult = await ocrWithFallback(enhanced, language);
             if ((enhancedResult.word_count || 0) > wordCount) {
               ocrText = enhancedResult.text || '';
@@ -2273,9 +2370,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       // Step 3: Classify + generate filename (deduplicate same-second collisions)
       const classification = classifyDocumentForFiling(ocrText, profile, description);
       const ext = profile === 'photo' ? 'jpg' : 'pdf';
-      const rawFilename =
-        filenameOverride ||
-        (await generateFilename(ocrText, classification, description || '', ext));
+      const rawFilename = filenameOverride || await generateFilename(ocrText, classification, description || '', ext);
       let baseFilename = typeof rawFilename === 'string' ? rawFilename : String(rawFilename ?? '');
       if (usedFilenames.has(baseFilename)) {
         // Append _p2, _p3 … before the extension to avoid collisions
@@ -2326,16 +2421,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       };
 
       if (profile === 'event') {
-        result.note =
-          'Event profile — use ocr__extract_event_details for calendar creation instead.';
+        result.note = 'Event profile — use ocr__extract_event_details for calendar creation instead.';
         result.raw_text = ocrText;
       }
 
       return result;
     }
 
-    try {
-      if (isADF) {
+    if (isADF) {
         // Why: ADF feeder may contain multiple pages; scan one page at a time in a
         //      loop until SANE signals the feeder is empty (exit code 7 / "No documents").
         // What: By default (separate_pages=false) collects all page JPEGs, merges them
@@ -2361,51 +2454,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         //   ADF approach for the Canon MF741C.
 
         await sendProgress(0, -1, 'ADF scan starting — warming up scanner');
+        if (jobId) updateScanJob(jobId, { status: 'RUNNING', progress: { stage: 'adf_starting', total_pages: null } });
 
         const pageJpegs = await scanAdfViaEscl(timestamp, scanMode, 300, (count, msg) => {
           sendProgress(count, 99, msg);
+          if (jobId) updateScanJob(jobId, { progress: { stage: 'adf_fetching', current_page: count } });
         });
         for (const f of pageJpegs) allTempFiles.push(f);
 
         if (pageJpegs.length === 0) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  success: false,
-                  error: 'ADF feeder was empty — no pages scanned.',
-                }),
-              },
-            ],
-            isError: true,
-          };
+          return { success: false, error: 'ADF feeder was empty — no pages scanned.' };
         }
 
-        await sendProgress(
-          pageJpegs.length,
-          pageJpegs.length,
-          `${pageJpegs.length} page(s) scanned`
-        );
+        await sendProgress(pageJpegs.length, pageJpegs.length, `${pageJpegs.length} page(s) scanned`);
+        if (jobId) updateScanJob(jobId, { progress: { stage: 'adf_fetching', current_page: pageJpegs.length, total_pages: pageJpegs.length } });
 
         if (separate_pages) {
           // Opt-in: original per-page pipeline — process each JPEG independently
           const pageResults = [];
           for (let i = 0; i < pageJpegs.length; i++) {
             const tmpJpeg = pageJpegs[i];
-            const tmpPdf = `/tmp/scan_${timestamp}_p${i + 1}.pdf`;
+            const tmpPdf  = `/tmp/scan_${timestamp}_p${i + 1}.pdf`;
             allTempFiles.push(tmpPdf);
             const pageResult = await processSinglePage(tmpJpeg, tmpPdf, `p${i + 1}`);
             pageResults.push(pageResult);
           }
 
           // Return flat format for single page (backward compat), multi-page envelope otherwise
-          const response =
-            pageResults.length === 1
-              ? pageResults[0]
-              : { success: true, pages: pageResults.length, results: pageResults };
+          const response = pageResults.length === 1
+            ? pageResults[0]
+            : { success: true, pages: pageResults.length, results: pageResults };
 
-          return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+          return response;
         }
 
         // Default: merge all pages into one PDF and file as a single document
@@ -2432,10 +2512,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             const enhanced = pageJpegs[0].replace('.jpg', '_enhanced.jpg');
             allTempFiles.push(enhanced);
             try {
-              execSync(
-                `convert ${JSON.stringify(pageJpegs[0])} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`,
-                { timeout: 30000 }
-              );
+              execSync(`convert ${JSON.stringify(pageJpegs[0])} -normalize -sharpen 0x1 -threshold 50% ${JSON.stringify(enhanced)}`, { timeout: 30000 });
               const enhancedResult = await ocrWithFallback(enhanced, language);
               if ((enhancedResult.word_count || 0) > wordCount) {
                 ocrText = enhancedResult.text || '';
@@ -2451,13 +2528,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         }
 
         await sendProgress(60, 100, 'OCR complete');
+        if (jobId) updateScanJob(jobId, { progress: { stage: 'ocr' } });
 
         // Step 3: Classify + generate filename from page 1 OCR
         const classification = classifyDocumentForFiling(ocrText, profile, description);
         const ext = profile === 'photo' ? 'jpg' : 'pdf';
-        const filename =
-          filenameOverride ||
-          (await generateFilename(ocrText, classification, description || '', ext));
+        const filename = filenameOverride || await generateFilename(ocrText, classification, description || '', ext);
         const ncPath = ncPathOverride || classification.path;
 
         // Step 4: Merge all page JPEGs into one PDF via ImageMagick, then run ocrmypdf
@@ -2479,7 +2555,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           } else {
             // Multiple pages — merge JPEGs into a single PDF first
             execSync(
-              `convert ${pageJpegs.map((p) => JSON.stringify(p)).join(' ')} ${JSON.stringify(mergedPdf)}`,
+              `convert ${pageJpegs.map(p => JSON.stringify(p)).join(' ')} ${JSON.stringify(mergedPdf)}`,
               { timeout: 60000 }
             );
 
@@ -2491,12 +2567,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
               const blob = new Blob([fileBytes], { type: 'application/pdf' });
               const form = new FormData();
               form.append('file', blob, 'merged.pdf');
-              const pdfParams = new URLSearchParams({
-                deskew: 'true',
-                optimize: '1',
-                rotate_pages: 'true',
-                language: language || 'eng',
-              });
+              const pdfParams = new URLSearchParams({ deskew: 'true', optimize: '1', rotate_pages: 'true', language: language || 'eng' });
               const ac = new AbortController();
               const timer = setTimeout(() => ac.abort(), 120000);
               let pdfResp;
@@ -2512,9 +2583,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
               if (pdfResp.ok) {
                 const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
                 if (pdfBuf.length < 5 || pdfBuf.slice(0, 5).toString('ascii') !== '%PDF-') {
-                  throw new Error(
-                    `polycr service returned non-PDF response (${pdfBuf.length} bytes)`
-                  );
+                  throw new Error(`polycr service returned non-PDF response (${pdfBuf.length} bytes)`);
                 }
                 fs.writeFileSync(ocrPdf, pdfBuf);
                 fileToUpload = ocrPdf;
@@ -2525,18 +2594,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             } catch (_remoteErr) {
               // Fallback: ocrmypdf CLI on the already-merged PDF
               try {
-                await execFileAsync('ocrmypdf', [
-                  '--rotate-pages',
-                  '--deskew',
-                  '--optimize',
-                  '1',
-                  '--image-dpi',
-                  '300',
-                  '--language',
-                  language || 'eng',
-                  mergedPdf,
-                  ocrPdf,
-                ]);
+                await execFileAsync('ocrmypdf', ['--rotate-pages', '--deskew', '--optimize', '1', '--image-dpi', '300', '--language', language || 'eng', mergedPdf, ocrPdf]);
                 fileToUpload = ocrPdf;
                 pdfMethod = 'ocrmypdf-local';
               } catch (_cliErr) {
@@ -2549,11 +2607,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         }
 
         await sendProgress(80, 100, 'PDF created');
+        if (jobId) updateScanJob(jobId, { progress: { stage: 'pdf' } });
 
         // Step 6: Upload single PDF to Nextcloud
         if (profile !== 'event' && ncPath) {
           await nextcloudUpload(fileToUpload, ncPath, filename);
           await sendProgress(95, 100, 'Uploaded to Nextcloud');
+          if (jobId) updateScanJob(jobId, { progress: { stage: 'upload' } });
         }
 
         // Build flat single-result response
@@ -2575,17 +2635,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         };
 
         if (profile === 'event') {
-          mergedResult.note =
-            'Event profile — use ocr__extract_event_details for calendar creation instead.';
+          mergedResult.note = 'Event profile — use ocr__extract_event_details for calendar creation instead.';
           mergedResult.raw_text = ocrText;
         }
 
-        return { content: [{ type: 'text', text: JSON.stringify(mergedResult, null, 2) }] };
+        return mergedResult;
+
       } else {
         // Non-ADF (Flatbed): original single-scan path
         const tmpJpeg = `/tmp/scan_${timestamp}.jpg`;
-        const tmpPdf = `/tmp/scan_${timestamp}.pdf`;
+        const tmpPdf  = `/tmp/scan_${timestamp}.pdf`;
         allTempFiles.push(tmpJpeg, tmpPdf);
+
+        if (jobId) updateScanJob(jobId, { status: 'RUNNING', progress: { stage: 'adf_starting', total_pages: 1 } });
 
         // Step 1: Scan
         execSync(
@@ -2593,25 +2655,103 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           { timeout: 120000 }
         );
 
+        if (jobId) updateScanJob(jobId, { progress: { stage: 'ocr', current_page: 1, total_pages: 1 } });
+
         const result = await processSinglePage(tmpJpeg, tmpPdf, 'p1');
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return result;
       }
+    } // end runScan()
+
+    // All four tools (scan_and_file, quick_scan, scan_and_file_async, quick_scan_async)
+    // now use the async path: return a job_id immediately, run in background.
+    // Async path: create job, fire-and-forget runScan
+    let job;
+    try {
+      job = createScanJob();
     } catch (err) {
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ success: false, error: err.message }) }],
-        isError: true,
-      };
-    } finally {
-      // Clean up all temp files regardless of success or failure
-      for (const f of allTempFiles) {
-        try {
-          execSync(`rm -f ${JSON.stringify(f)}`);
-        } catch (_) {}
+      if (err.code === 'SCAN_ALREADY_RUNNING') {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: 'SCAN_ALREADY_RUNNING' }) }],
+          isError: true,
+        };
       }
+      throw err;
     }
+
+    const asyncJobId = job.job_id;
+    ;(async () => {
+      try {
+        const result = await runScan(asyncJobId);
+        if (result && result.success === false) {
+          finishScanJob(asyncJobId, 'FAILED', result);
+        } else {
+          finishScanJob(asyncJobId, 'COMPLETED', result);
+        }
+      } catch (err) {
+        finishScanJob(asyncJobId, 'FAILED', err);
+      } finally {
+        for (const f of allTempFiles) {
+          try { execSync(`rm -f ${JSON.stringify(f)}`); } catch (_) {}
+        }
+      }
+    })().catch(() => {});
+
+    const { result: _r, ...jobStatus } = job;
+    const enrichedResponse = {
+      ...jobStatus,
+      next_action: `IMPORTANT: The scan is running in the background. Call get_scan_job_status with job_id="${jobStatus.job_id}" every 5-10 seconds until status becomes COMPLETED (typical scan time: 90-180 seconds). Then call get_scan_job_result with the same job_id to retrieve the final result. Do NOT assume the scan failed if the first status check shows PENDING or RUNNING — keep polling.`,
+      estimated_duration_seconds: 120,
+    };
+    return { content: [{ type: 'text', text: JSON.stringify(enrichedResponse, null, 2) }] };
   }
 
-  if (name === 'nextcloud_move') {
+  if (name === "get_scan_job_status") {
+    const state = scanJobs.get(args.job_id);
+    if (!state) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'unknown job_id', job_id: args.job_id }) }],
+        isError: true,
+      };
+    }
+    // Return a copy without the result blob to keep the response small
+    const { result: _result, ...statusOnly } = state;
+    return { content: [{ type: 'text', text: JSON.stringify(statusOnly, null, 2) }] };
+  }
+
+  if (name === "get_scan_job_result") {
+    const state = scanJobs.get(args.job_id);
+    if (!state) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'unknown job_id', job_id: args.job_id }) }],
+        isError: true,
+      };
+    }
+    if (state.status !== 'COMPLETED') {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: `job not complete (status=${state.status})`, status: state.status, error_msg: state.error }) }],
+        isError: true,
+      };
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(state.result, null, 2) }] };
+  }
+
+  if (name === "cancel_scan_job") {
+    const state = scanJobs.get(args.job_id);
+    if (!state) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'unknown job_id', job_id: args.job_id }) }],
+        isError: true,
+      };
+    }
+    if (state.status === 'PENDING' || state.status === 'RUNNING') {
+      // Best-effort: update state immediately; underlying scan may still complete
+      finishScanJob(state.job_id, 'CANCELLED', null);
+    }
+    const { result: _result, ...statusOnly } = state;
+    return { content: [{ type: 'text', text: JSON.stringify(statusOnly, null, 2) }] };
+  }
+
+  if (name === "nextcloud_move") {
     const { source_path, dest_path } = args;
 
     // Pre-validate identical paths: Nextcloud otherwise returns an opaque HTTP 403
@@ -2626,9 +2766,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     // WebDAV URL, while preserving the / directory separators.
     const encodePath = (p) => p.split('/').map(encodeURIComponent).join('/');
 
-    const auth = `Basic ${Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64')}`;
+    const auth = 'Basic ' + Buffer.from(`${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}`).toString('base64');
     const sourceUrl = `${NEXTCLOUD_WEBDAV_BASE}${encodePath(source_path)}`;
-    const destUrl = `${NEXTCLOUD_WEBDAV_BASE}${encodePath(dest_path)}`;
+    const destUrl   = `${NEXTCLOUD_WEBDAV_BASE}${encodePath(dest_path)}`;
 
     const resp = await fetch(sourceUrl, {
       method: 'MOVE',
@@ -2644,16 +2784,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
 
     return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({ success: true, moved_to: destUrl }),
-        },
-      ],
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ success: true, moved_to: destUrl }),
+      }],
     };
   }
 
-  if (name === 'split_and_refile') {
+  if (name === "split_and_refile") {
     const { source_path, delete_original = false, description } = args || {};
     const timestamp = Date.now();
     const allTempFiles = [];
@@ -2671,29 +2809,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
       // Validate
       if (!source_path || typeof source_path !== 'string') {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({ success: false, error: 'source_path is required.' }),
-            },
-          ],
-          isError: true,
-        };
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'source_path is required.' }) }], isError: true };
       }
       if (!source_path.toLowerCase().endsWith('.pdf')) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                success: false,
-                error: 'source_path must point to a .pdf file.',
-              }),
-            },
-          ],
-          isError: true,
-        };
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'source_path must point to a .pdf file.' }) }], isError: true };
       }
 
       // Download PDF from Nextcloud
@@ -2703,54 +2822,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       try {
         await nextcloudDownload(source_path, sourcePdf);
       } catch (dlErr) {
-        const msg =
-          dlErr.message.includes('404') || dlErr.message.includes('HTTP 404')
-            ? `File not found at ${source_path}`
-            : `Download failed: ${dlErr.message}`;
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ success: false, error: msg }) }],
-          isError: true,
-        };
+        const msg = dlErr.message.includes('404') || dlErr.message.includes('HTTP 404')
+          ? `File not found at ${source_path}`
+          : `Download failed: ${dlErr.message}`;
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: msg }) }], isError: true };
       }
 
       // Get page count via pdfinfo (purpose-built, no rendering required)
       let pageCount;
       try {
-        const pdfInfoOut = execSync(`pdfinfo ${JSON.stringify(sourcePdf)} 2>/dev/null`, {
-          timeout: 10000,
-        }).toString();
+        const pdfInfoOut = execSync(`pdfinfo ${JSON.stringify(sourcePdf)} 2>/dev/null`, { timeout: 10000 }).toString();
         const pagesMatch = pdfInfoOut.match(/^Pages:\s+(\d+)/m);
-        pageCount = pagesMatch ? Number.parseInt(pagesMatch[1], 10) : 0;
+        pageCount = pagesMatch ? parseInt(pagesMatch[1], 10) : 0;
         if (!pageCount || pageCount < 1) throw new Error('pdfinfo returned 0 pages');
       } catch (_) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                success: false,
-                error: 'Could not determine page count — is this a valid PDF?',
-              }),
-            },
-          ],
-          isError: true,
-        };
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'Could not determine page count — is this a valid PDF?' }) }], isError: true };
       }
 
       // Single-page edge case
       if (pageCount === 1 && !delete_original) {
         return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                success: false,
-                error:
-                  'This PDF has only 1 page — nothing to split. To move it to a different folder use ocr__nextcloud_move instead.',
-                pages: 1,
-              }),
-            },
-          ],
+          content: [{ type: 'text', text: JSON.stringify({
+            success: false,
+            error: 'This PDF has only 1 page — nothing to split. To move it to a different folder use ocr__nextcloud_move instead.',
+            pages: 1,
+          }) }],
         };
       }
 
@@ -2759,16 +2855,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       // NOT corrupt ToUnicode CMaps, pdfseparate is faster and more appropriate for this task.
       await sendProgress(0, pageCount, `${pageCount} page(s) found — splitting`);
       const splitPattern = `/tmp/split_${timestamp}_p%d.pdf`;
-      execSync(`pdfseparate ${JSON.stringify(sourcePdf)} ${JSON.stringify(splitPattern)}`, {
-        timeout: 60000,
-      });
+      execSync(`pdfseparate ${JSON.stringify(sourcePdf)} ${JSON.stringify(splitPattern)}`, { timeout: 60000 });
 
       const usedFilenames = new Set();
       const results = [];
       let anyFailed = false;
 
       for (let i = 1; i <= pageCount; i++) {
-        const splitPdf = `/tmp/split_${timestamp}_p${i}.pdf`;
+        const splitPdf  = `/tmp/split_${timestamp}_p${i}.pdf`;
         const splitJpeg = `/tmp/split_${timestamp}_p${i}.jpg`;
         allTempFiles.push(splitPdf, splitJpeg);
 
@@ -2783,9 +2877,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           let confidence = 0;
           let pdfMethod = 'existing-text-layer';
           try {
-            ocrText = execSync(`pdftotext ${JSON.stringify(splitPdf)} -`, { timeout: 10000 })
-              .toString()
-              .trim();
+            ocrText = execSync(`pdftotext ${JSON.stringify(splitPdf)} -`, { timeout: 10000 }).toString().trim();
             wordCount = countWords(ocrText);
             confidence = wordCount > 0 ? 0.9 : 0;
           } catch (_) {}
@@ -2831,8 +2923,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           const ncPath = classification.path || '/Inbox/';
           await nextcloudUpload(splitPdf, ncPath, filename);
 
-          const inboxFlag =
-            ncPath === '/Inbox/' ? 'Could not classify — filed to /Inbox/' : undefined;
+          const inboxFlag = ncPath === '/Inbox/' ? 'Could not classify — filed to /Inbox/' : undefined;
 
           results.push({
             page: i,
@@ -2846,6 +2937,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             ocr_preview: ocrText.slice(0, 200).trim() || null,
             ...(inboxFlag ? { note: inboxFlag } : {}),
           });
+
         } catch (pageErr) {
           anyFailed = true;
           results.push({ page: i, success: false, error: pageErr.message });
@@ -2871,30 +2963,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       await sendProgress(pageCount, pageCount, 'Done');
 
       return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              success: true,
-              pages_processed: pageCount,
-              pages_succeeded: results.filter((r) => r.success).length,
-              original_deleted: originalDeleted,
-              ...(deleteNote ? { delete_note: deleteNote } : {}),
-              results,
-            }),
-          },
-        ],
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            pages_processed: pageCount,
+            pages_succeeded: results.filter(r => r.success).length,
+            original_deleted: originalDeleted,
+            ...(deleteNote ? { delete_note: deleteNote } : {}),
+            results,
+          }),
+        }],
       };
+
     } finally {
       for (const f of allTempFiles) {
-        try {
-          execSync(`rm -f ${JSON.stringify(f)}`);
-        } catch (_) {}
+        try { execSync(`rm -f ${JSON.stringify(f)}`); } catch (_) {}
       }
     }
   }
 
-  if (name === 'ocr_inbound_media') {
+  if (name === "ocr_inbound_media") {
     const { media_id, file_nextcloud = false, description } = args || {};
     const mediaIdStr = typeof media_id === 'string' ? media_id : String(media_id ?? '');
     const inboundDir = path.join(os.homedir(), '.openclaw', 'media', 'inbound');
@@ -2903,29 +2992,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     let targetFile = null;
     if (media_id) {
       // Search for file whose name contains the media_id
-      const files = fs.readdirSync(inboundDir).filter((f) => f.includes(mediaIdStr));
+      const files = fs.readdirSync(inboundDir).filter(f => f.includes(mediaIdStr));
       if (files.length > 0) {
         targetFile = path.join(inboundDir, files[0]);
       }
     }
     if (!targetFile) {
       // Fall back to most recently modified file
-      const files = fs
-        .readdirSync(inboundDir)
-        .map((f) => ({ name: f, mtime: fs.statSync(path.join(inboundDir, f)).mtimeMs }))
-        .filter((f) => /\.(jpg|jpeg|png|tiff?|bmp|webp)$/i.test(f.name))
+      const files = fs.readdirSync(inboundDir)
+        .map(f => ({ name: f, mtime: fs.statSync(path.join(inboundDir, f)).mtimeMs }))
+        .filter(f => /\.(jpg|jpeg|png|tiff?|bmp|webp)$/i.test(f.name))
         .sort((a, b) => b.mtime - a.mtime);
       if (files.length === 0) {
         return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                success: false,
-                error: 'No image files found in media/inbound. Please attach an image first.',
-              }),
-            },
-          ],
+          content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'No image files found in media/inbound. Please attach an image first.' }) }],
           isError: true,
         };
       }
@@ -2937,20 +3017,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
     if (!file_nextcloud) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              success: true,
-              source_file: path.basename(targetFile),
-              text: ocrResult.text || '',
-              engine_used: ocrResult.engine_used,
-              confidence: ocrResult.confidence,
-              word_count: ocrResult.word_count || 0,
-              empty: !ocrResult.text || ocrResult.word_count === 0,
-            }),
-          },
-        ],
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            source_file: path.basename(targetFile),
+            text: ocrResult.text || '',
+            engine_used: ocrResult.engine_used,
+            confidence: ocrResult.confidence,
+            word_count: ocrResult.word_count || 0,
+            empty: !ocrResult.text || ocrResult.word_count === 0,
+          }),
+        }],
       };
     }
 
@@ -2960,71 +3038,71 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
       const pdfResult = await createSearchablePdfFromJpeg(targetFile, tmpPdf);
       const classification = classifyDocumentForFiling(ocrResult.text || '', 'doc-bw', description);
-      const filename = await generateFilename(
-        ocrResult.text || '',
-        classification,
-        description || '',
-        'pdf'
-      );
+      const filename = await generateFilename(ocrResult.text || '', classification, description || '', 'pdf');
       const ncPath = classification.path || '/Inbox/';
       await nextcloudUpload(tmpPdf, ncPath, filename);
       return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              success: true,
-              source_file: path.basename(targetFile),
-              filed_at: `${ncPath}${filename}`,
-              filename,
-              document_type: classification.type,
-              pdf_method: pdfResult.method,
-              word_count: ocrResult.word_count || 0,
-              ocr_preview: (ocrResult.text || '').slice(0, 300).trim(),
-            }),
-          },
-        ],
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            source_file: path.basename(targetFile),
+            filed_at: `${ncPath}${filename}`,
+            filename,
+            document_type: classification.type,
+            pdf_method: pdfResult.method,
+            word_count: ocrResult.word_count || 0,
+            ocr_preview: (ocrResult.text || '').slice(0, 300).trim(),
+          }),
+        }],
       };
     } finally {
-      try {
-        fs.unlinkSync(tmpPdf);
-      } catch (_) {}
+      try { fs.unlinkSync(tmpPdf); } catch (_) {}
     }
   }
 
-  if (name === 'fetch_url_as_base64') {
+  if (name === "fetch_url_as_base64") {
     // Why: Lets receipts-agent pull bytes from authenticated callbacks (e.g., receipts-web
     //      /api/inbox/raw) without proliferating per-service tools. Returns base64 so the
-    //      payload survives JSON transport and can be fed straight to ocr_image_from_base64.
+    //      payload survives JSON transport (e.g. a client can decode it to a local file
+    //      and then OCR via ocr_image_from_base64, which now takes a file path).
     // What: Performs a single HTTP request with caller-controlled method/body/auth, enforces
     //       a 30s timeout and a configurable max response size, and returns
     //       { ok, status, content_type, size_bytes, base64 } or { ok:false, status?, error }.
     // Test: Mock a 200 response; assert ok===true and base64 round-trips. Mock a 404; assert
     //       ok===false and status===404. Mock an oversize body; assert ok===false with
     //       error including "max_bytes".
-    const { url, auth_header, method = 'GET', body, max_bytes = 25 * 1024 * 1024 } = args || {};
+    const {
+      url,
+      auth_header,
+      method = "GET",
+      body,
+      max_bytes = 25 * 1024 * 1024,
+    } = args || {};
 
-    if (!url || typeof url !== 'string') {
-      throw new Error('url must be a non-empty string');
+    if (!url || typeof url !== "string") {
+      throw new Error("url must be a non-empty string");
     }
-    const allowedMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+    const allowedMethods = ["GET", "POST", "PUT", "PATCH", "DELETE"];
     const httpMethod = String(method).toUpperCase();
     if (!allowedMethods.includes(httpMethod)) {
-      throw new Error(`method must be one of ${allowedMethods.join(', ')}`);
+      throw new Error(`method must be one of ${allowedMethods.join(", ")}`);
     }
     const cap =
-      Number.isFinite(max_bytes) && max_bytes > 0 ? Math.floor(max_bytes) : 25 * 1024 * 1024;
+      Number.isFinite(max_bytes) && max_bytes > 0
+        ? Math.floor(max_bytes)
+        : 25 * 1024 * 1024;
 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 30000);
 
     try {
       const headers = {};
-      if (auth_header && typeof auth_header === 'string') {
-        headers.Authorization = auth_header;
+      if (auth_header && typeof auth_header === "string") {
+        headers["Authorization"] = auth_header;
       }
       if (body !== undefined && body !== null) {
-        headers['Content-Type'] = 'application/json';
+        headers["Content-Type"] = "application/json";
       }
 
       let resp;
@@ -3034,7 +3112,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           headers,
           body:
             body !== undefined && body !== null
-              ? typeof body === 'string'
+              ? typeof body === "string"
                 ? body
                 : JSON.stringify(body)
               : undefined,
@@ -3045,17 +3123,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return {
           content: [
             {
-              type: 'text',
+              type: "text",
               text: JSON.stringify({
                 ok: false,
-                error: `fetch failed: ${err?.message ? err.message : String(err)}`,
+                error: `fetch failed: ${err && err.message ? err.message : String(err)}`,
               }),
             },
           ],
         };
       }
 
-      const contentType = resp.headers.get('content-type') || '';
+      const contentType = resp.headers.get("content-type") || "";
 
       if (!resp.ok) {
         // Drain (best-effort) so the connection can be released cleanly.
@@ -3066,7 +3144,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return {
           content: [
             {
-              type: 'text',
+              type: "text",
               text: JSON.stringify({
                 ok: false,
                 status: resp.status,
@@ -3095,11 +3173,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return {
           content: [
             {
-              type: 'text',
+              type: "text",
               text: JSON.stringify({
                 ok: false,
                 status: resp.status,
-                error: `read failed: ${err?.message ? err.message : String(err)}`,
+                error: `read failed: ${err && err.message ? err.message : String(err)}`,
               }),
             },
           ],
@@ -3111,7 +3189,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return {
           content: [
             {
-              type: 'text',
+              type: "text",
               text: JSON.stringify({
                 ok: false,
                 status: resp.status,
@@ -3126,13 +3204,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       return {
         content: [
           {
-            type: 'text',
+            type: "text",
             text: JSON.stringify({
               ok: true,
               status: resp.status,
               content_type: contentType,
               size_bytes: buf.length,
-              base64: buf.toString('base64'),
+              base64: buf.toString("base64"),
             }),
           },
         ],
@@ -3142,10 +3220,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
   }
 
-  if (name === 'detect_document_bbox') {
+  if (name === "detect_document_bbox") {
     const { file_path } = args;
-    if (!file_path || typeof file_path !== 'string') {
-      throw new Error('file_path must be a non-empty string');
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
     }
     if (!fs.existsSync(file_path)) {
       throw new Error(`File not found: ${file_path}`);
@@ -3153,44 +3231,160 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
     try {
       const form = new FormData();
-      form.append('file', fs.createReadStream(file_path));
-      const res = await fetch(`${POLYCR_URL}/detect`, { method: 'POST', body: form });
+      form.append("file", fs.createReadStream(file_path));
+      const res = await fetch(`${POLYCR_URL}/detect`, { method: "POST", body: form });
       if (!res.ok) {
         return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                error: `polycr /detect returned HTTP ${res.status}`,
-                corners: null,
-                bbox: null,
-              }),
-            },
-          ],
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: `polycr /detect returned HTTP ${res.status}`,
+              corners: null,
+              bbox: null,
+            }),
+          }],
           isError: true,
         };
       }
       const data = await res.json();
       return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(data),
-          },
-        ],
+        content: [{
+          type: "text",
+          text: JSON.stringify(data),
+        }],
       };
     } catch (err) {
       return {
-        content: [
-          {
-            type: 'text',
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            error: err && err.message ? err.message : String(err),
+            corners: null,
+            bbox: null,
+          }),
+        }],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === "pdf_text_extract") {
+    // Why: Tagged PDFs and digitally-created PDFs already have a selectable text layer.
+    //      Running pdftotext is orders of magnitude faster than OCR and produces
+    //      higher-fidelity output (no character recognition errors).
+    // What: Runs `pdftotext <path> -` (stdout mode) and returns the text.
+    //       If word_count is 0 the PDF likely has no text layer and the caller
+    //       should fall back to an OCR tool (ocr_image_polycr or polycr_process_pdf).
+    // Test: Call with a Tagged PDF; assert word_count > 0.
+    //       Call with an image-only PDF; assert empty is true and error is null.
+    const { file_path } = args;
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
+    }
+    if (!fs.existsSync(file_path)) {
+      throw new Error(`File not found: ${file_path}`);
+    }
+    try {
+      const { stdout } = await execFileAsync("pdftotext", [file_path, "-"]);
+      const wc = countWords(stdout);
+      // Count pages by looking for form-feed characters pdftotext inserts between pages
+      const pages = stdout.split("\f").filter(p => p.trim().length > 0).length || 1;
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({ text: stdout, word_count: wc, empty: wc === 0, pages }),
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            text: "",
+            word_count: 0,
+            empty: true,
+            pages: 0,
+            error: err && err.message ? err.message : String(err),
+          }),
+        }],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === "polycr_process_pdf") {
+    // Why: The POLYCR /process endpoint (OWUI external document loader) handles both
+    //      Tagged PDFs (rasterize + OCR via pdf2image/Tesseract/PaddleOCR/EasyOCR on
+    //      the GPU host) and image files. This consolidates PDF extraction on a single
+    //      backend shared with Open WebUI, avoiding duplication.
+    // What: PUT file bytes to POLYCR_URL/process with Content-Type and X-Filename
+    //       headers (OWUI external loader contract). Returns page_content and metadata.
+    // Test: Call with the enrichment_letter.pdf Tagged PDF; assert page_content is non-empty
+    //       and contains schedule text.
+    const { file_path } = args;
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
+    }
+    if (!fs.existsSync(file_path)) {
+      throw new Error(`File not found: ${file_path}`);
+    }
+    const fileBytes = fs.readFileSync(file_path);
+    const ext = path.extname(file_path).slice(1).toLowerCase() || "pdf";
+    const mimeMap = {
+      pdf: "application/pdf",
+      jpg: "image/jpeg", jpeg: "image/jpeg",
+      png: "image/png", gif: "image/gif",
+      webp: "image/webp", tiff: "image/tiff", bmp: "image/bmp",
+    };
+    const mime = mimeMap[ext] || "application/octet-stream";
+    const filename = path.basename(file_path);
+
+    const ac = new AbortController();
+    // 120s timeout — rasterize + multi-engine OCR on a large PDF can be slow
+    const timer = setTimeout(() => ac.abort(), 120000);
+    try {
+      const resp = await fetch(`${POLYCR_URL}/process`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": mime,
+          "X-Filename": encodeURIComponent(filename),
+        },
+        body: fileBytes,
+        signal: ac.signal,
+      });
+      clearTimeout(timer);
+      if (!resp.ok) {
+        const errBody = await resp.text().catch(() => "");
+        return {
+          content: [{
+            type: "text",
             text: JSON.stringify({
-              error: err?.message ? err.message : String(err),
-              corners: null,
-              bbox: null,
+              page_content: "",
+              metadata: {},
+              error: `POLYCR /process returned HTTP ${resp.status}: ${errBody.slice(0, 200)}`,
             }),
-          },
-        ],
+          }],
+          isError: true,
+        };
+      }
+      const data = await resp.json();
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(data),
+        }],
+      };
+    } catch (err) {
+      clearTimeout(timer);
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            page_content: "",
+            metadata: {},
+            error: err && err.message ? err.message : String(err),
+          }),
+        }],
         isError: true,
       };
     }
