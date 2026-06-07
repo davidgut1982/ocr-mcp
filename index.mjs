@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 
-const POLYCR_HOST = process.env.POLYCR_HOST || '192.168.1.30';
+const POLYCR_HOST = process.env.POLYCR_HOST || 'polycr';
 const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
 const POLYCR_PDF_URL = process.env.POLYCR_PDF_URL || `http://${new URL(POLYCR_URL).hostname}:8001`;
 const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
@@ -52,6 +52,46 @@ const BLANK_PAGE_THRESHOLD_BYTES = 200_000;
 const LITELLM_URL = process.env.LITELLM_URL || 'http://192.168.1.23:4000/v1/chat/completions';
 const LITELLM_KEY = process.env.LITELLM_KEY || 'sk-litellm-openclaw';
 const LITELLM_MODEL = process.env.LITELLM_MODEL || 'auto';
+
+// Vision OCR endpoint — a vision-language model served via an OpenAI-compatible
+// /v1/chat/completions API.  Used for direct image-to-text OCR on stylized,
+// decorative, or scanned images that defeat traditional OCR engines.
+//
+// VISION_OCR_URL  — base URL of the inference endpoint (no trailing slash).
+//   Default: http://polycr:8000  (local self-hosted, keyless)
+//   OpenRouter: https://openrouter.ai/api
+//
+// VISION_OCR_MODEL — model name sent in the request body.
+//   Default: qwen/qwen3-vl-32b-instruct  (OpenRouter target)
+//   Legacy polycr callers that relied on the old default "qwen2.5-vl" should
+//   set this env explicitly; the new default is the desired end state.
+//
+// VISION_OCR_KEY — Bearer token for the vision endpoint.
+//   Resolved as: VISION_OCR_KEY ?? OPENROUTER_API_KEY
+//   Treat empty string / literal "none" / literal "null" as absent.
+//   When absent, no Authorization header is sent (preserves keyless polycr behaviour).
+const VISION_OCR_URL = process.env.VISION_OCR_URL || 'http://polycr:8000';
+const VISION_OCR_MODEL = process.env.VISION_OCR_MODEL || 'qwen/qwen3-vl-32b-instruct';
+
+// Why: Centralises key resolution so both vision call sites use identical logic.
+// What: Returns the trimmed bearer token, or null when no usable key is configured.
+// Test: Set VISION_OCR_KEY="none" → null; set OPENROUTER_API_KEY="sk-x" → "sk-x".
+function resolveVisionKey() {
+  const raw = process.env.VISION_OCR_KEY || process.env.OPENROUTER_API_KEY || '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === 'none' || trimmed === 'null') return null;
+  return trimmed;
+}
+
+// Why: Keeps fetch header construction DRY across both vision call sites.
+// What: Returns a headers object; adds Authorization only when a key is available.
+// Test: Call with key=null → headers has no Authorization; key="sk-x" → headers has Bearer sk-x.
+function visionHeaders(extraHeaders = {}) {
+  const key = resolveVisionKey();
+  const base = { 'Content-Type': 'application/json', ...extraHeaders };
+  if (key) base.Authorization = `Bearer ${key}`;
+  return base;
+}
 
 // Why: Provides a promisified sleep for async retry loops and rate-limit backoff.
 // What: Returns a Promise that resolves after `ms` milliseconds.
@@ -1250,6 +1290,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "ocr_image_vision",
+      description:
+        "Extract text from an image at a URL using a vision-language model (configured via VISION_OCR_MODEL env, default qwen/qwen3-vl-32b-instruct). Best for stylized, decorative, or scene text that defeats traditional OCR engines — the model 'reads' the image directly. Fetches the image from image_url, sends it to the vision OCR endpoint, and returns the extracted text. Use a custom prompt to tune extraction behavior.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          image_url: {
+            type: "string",
+            format: "uri",
+            description: "URL to fetch the image from",
+          },
+          prompt: {
+            type: "string",
+            description:
+              "Optional instruction for the vision model. Defaults to a faithful text-extraction prompt.",
+          },
+          auth_header: {
+            type: "string",
+            description:
+              "Optional Authorization header value (e.g., 'Bearer xyz') for fetching images from authenticated URLs.",
+          },
+        },
+        required: ["image_url"],
+      },
+    },
+    {
       name: "extract_event_details",
       description:
         "OCR an image and classify the document type using keyword heuristics. Auto-orients the image first. Returns raw_text, engine_used, confidence, word_count, likely_document_type, and document_signals.",
@@ -1703,6 +1769,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["file_path"],
       },
     },
+    {
+      name: "ocr_pdf_vision",
+      description:
+        "Extract text from a PDF file using vision OCR. Converts each PDF page to an image with pdftoppm, then sends each page image to the vision-language model (configured via VISION_OCR_MODEL env, default qwen/qwen3-vl-32b-instruct). Best for scanned/image-only PDFs with no selectable text layer. Returns JSON with text (all pages concatenated), page_count, word_count, empty, and any per-page errors.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file_path: {
+            type: "string",
+            description: "Absolute path to the local PDF file",
+          },
+          prompt: {
+            type: "string",
+            description:
+              "Optional instruction for the vision model. Defaults to faithful text-extraction prompt.",
+          },
+          dpi: {
+            type: "number",
+            description: "Render DPI for PDF pages (default: 200). Higher is more accurate but slower.",
+          },
+        },
+        required: ["file_path"],
+      },
+    },
   ],
 }));
 
@@ -1805,6 +1895,119 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
     return {
       content: [{ type: "text", text: JSON.stringify(output) }],
+    };
+  }
+
+  if (name === "ocr_image_vision") {
+    // Why: Stylized/decorative/scene text defeats traditional OCR engines (tesseract,
+    //      PaddleOCR); a vision-language model "reads" the image holistically and
+    //      transcribes such text accurately.
+    // What: Fetches the image from image_url as a buffer, base64-encodes it, and POSTs a
+    //       data-URL + prompt to the vision endpoint (VISION_OCR_MODEL); returns the model's text.
+    // Test: Call with a URL to a stylized-text image; assert the returned text matches the
+    //       visible text. Call with an unreachable URL; assert a descriptive error is thrown.
+    const { image_url } = args;
+    const prompt =
+      typeof args.prompt === "string" && args.prompt.trim().length > 0
+        ? args.prompt
+        : "Extract all text from this image exactly as it appears, including any decorative or stylized text. Return only the extracted text, preserving layout where possible.";
+
+    if (!image_url || typeof image_url !== "string") {
+      throw new Error("image_url must be a non-empty string");
+    }
+
+    // Fetch or read the image as a buffer and derive its content type.
+    const extToMime = {
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      gif: "image/gif",
+      webp: "image/webp",
+      tiff: "image/tiff",
+      tif: "image/tiff",
+      bmp: "image/bmp",
+    };
+
+    let imgBuf;
+    let contentType;
+    const isLocalPath = image_url.startsWith("/") || image_url.startsWith("./") || image_url.startsWith("file://");
+    if (isLocalPath) {
+      // Local file — read directly from disk
+      const localPath = image_url.startsWith("file://") ? new URL(image_url).pathname : image_url;
+      if (!fs.existsSync(localPath)) {
+        throw new Error(`Local file not found: ${localPath}`);
+      }
+      imgBuf = fs.readFileSync(localPath);
+      const urlExt = (localPath.split(".").pop() || "").toLowerCase();
+      contentType = extToMime[urlExt] || "image/jpeg";
+    } else {
+      // Remote URL — fetch over HTTP/HTTPS
+      const fetchHeaders = {};
+      if (typeof args.auth_header === "string" && args.auth_header.trim()) {
+        fetchHeaders["Authorization"] = args.auth_header;
+      }
+      const imgResp = await fetch(image_url, { headers: fetchHeaders });
+      if (!imgResp.ok) {
+        throw new Error(`Failed to fetch image from URL: HTTP ${imgResp.status}`);
+      }
+      imgBuf = Buffer.from(await imgResp.arrayBuffer());
+      const headerType = (imgResp.headers.get("content-type") || "").split(";")[0].trim();
+      const urlExt = (image_url.split("?")[0].split(".").pop() || "").toLowerCase();
+      contentType =
+        (headerType.startsWith("image/") && headerType) ||
+        extToMime[urlExt] ||
+        "image/jpeg";
+    }
+    const base64data = imgBuf.toString("base64");
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 120000);
+    let resp;
+    try {
+      resp = await fetch(`${VISION_OCR_URL}/v1/chat/completions`, {
+        method: "POST",
+        headers: visionHeaders(),
+        body: JSON.stringify({
+          model: VISION_OCR_MODEL,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "image_url",
+                  image_url: { url: `data:${contentType};base64,${base64data}` },
+                },
+                { type: "text", text: prompt },
+              ],
+            },
+          ],
+          max_tokens: 4096,
+          temperature: 0.1,
+        }),
+        signal: ac.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      if (err?.name === "AbortError") {
+        throw new Error("Vision OCR request timed out after 120s");
+      }
+      throw new Error(`Vision OCR request failed: ${err.message}`);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`Vision OCR returned HTTP ${resp.status}: ${body.slice(0, 200)}`);
+    }
+    const data = await resp.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content || typeof content !== "string" || content.trim().length === 0) {
+      throw new Error("Vision OCR returned empty or invalid content");
+    }
+
+    return {
+      content: [{ type: "text", text: content.trim() }],
     };
   }
 
@@ -3387,6 +3590,135 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         }],
         isError: true,
       };
+    }
+  }
+
+  if (name === "ocr_pdf_vision") {
+    // Why: polycr_process_pdf's backend moved off 192.168.1.30:8000; scanned/image-only
+    //      PDFs need a working OCR path. This converts pages to images and reuses the
+    //      vision endpoint (VISION_OCR_MODEL) that already works for ocr_image_vision.
+    // What: Renders each PDF page to a JPEG via pdftoppm, POSTs each to the vision OCR
+    //       endpoint, concatenates per-page text; returns JSON with text, page_count,
+    //       word_count, empty, and any per-page errors.
+    // Test: Call with a scanned PDF path; assert page_count matches pages and text is
+    //       non-empty. Call with a missing path; assert "File not found" error.
+    const { file_path, dpi = 200 } = args;
+    const prompt =
+      typeof args.prompt === "string" && args.prompt.trim().length > 0
+        ? args.prompt
+        : "Extract all text from this image exactly as it appears. Return only the extracted text, preserving layout where possible.";
+
+    if (!file_path || typeof file_path !== "string") {
+      throw new Error("file_path must be a non-empty string");
+    }
+    if (!fs.existsSync(file_path)) {
+      throw new Error(`File not found: ${file_path}`);
+    }
+
+    // Convert PDF pages to images in a temp directory
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pdf_vision_"));
+    try {
+      // pdftoppm -jpeg -r <dpi> <input.pdf> <output_prefix>
+      // Produces: <output_prefix>-01.jpg, <output_prefix>-02.jpg, ...
+      const outPrefix = path.join(tmpDir, "page");
+      try {
+        await execFileAsync("pdftoppm", ["-jpeg", "-r", String(dpi), file_path, outPrefix]);
+      } catch (e) {
+        throw new Error(`pdftoppm failed: ${e.message}`);
+      }
+
+      // Collect page images, sorted by page number
+      const pageFiles = fs.readdirSync(tmpDir)
+        .filter(f => f.startsWith("page") && f.endsWith(".jpg"))
+        .sort()
+        .map(f => path.join(tmpDir, f));
+
+      if (pageFiles.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              text: "",
+              page_count: 0,
+              word_count: 0,
+              empty: true,
+              error: "pdftoppm produced no output pages",
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      // Process each page through vision OCR
+      // pdftoppm always outputs JPEG when invoked with -jpeg, so contentType is fixed below.
+      const pageResults = [];
+      for (const imgPath of pageFiles) {
+        try {
+          const imgBuf = fs.readFileSync(imgPath);
+          const base64data = imgBuf.toString("base64");
+          const contentType = "image/jpeg";
+          const dataUrl = `data:${contentType};base64,${base64data}`;
+
+          const payload = {
+            model: VISION_OCR_MODEL,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "image_url", image_url: { url: dataUrl } },
+                  { type: "text", text: prompt },
+                ],
+              },
+            ],
+            max_tokens: 4096,
+            temperature: 0,
+          };
+
+          const ac = new AbortController();
+          const timer = setTimeout(() => ac.abort(), 60000);
+          let respText;
+          try {
+            const resp = await fetch(`${VISION_OCR_URL}/v1/chat/completions`, {
+              method: "POST",
+              headers: visionHeaders(),
+              body: JSON.stringify(payload),
+              signal: ac.signal,
+            });
+            if (!resp.ok) {
+              const errBody = await resp.text().catch(() => "");
+              throw new Error(`Vision OCR HTTP ${resp.status}: ${errBody.slice(0, 200)}`);
+            }
+            const data = await resp.json();
+            respText = data?.choices?.[0]?.message?.content ?? "";
+          } finally {
+            clearTimeout(timer);
+          }
+          pageResults.push({ text: respText, error: null });
+        } catch (e) {
+          pageResults.push({ text: "", error: e.message });
+        }
+      }
+
+      const allText = pageResults.map((r, i) =>
+        pageResults.length > 1 ? `[Page ${i + 1}]\n${r.text}` : r.text
+      ).join("\n\n");
+      const wc = countWords(allText);
+      const errors = pageResults.filter(r => r.error).map((r, i) => `page ${i + 1}: ${r.error}`);
+
+      const output = {
+        text: allText,
+        page_count: pageFiles.length,
+        word_count: wc,
+        empty: wc === 0,
+      };
+      if (errors.length > 0) output.errors = errors;
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(output) }],
+      };
+    } finally {
+      // Clean up temp directory
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
     }
   }
 
