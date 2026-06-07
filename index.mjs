@@ -7,6 +7,9 @@ import { promisify } from 'node:util';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+// Scanner device registry and resolver — defined in scanners.mjs so unit tests
+// can exercise resolveScanner() without loading the full MCP server.
+import { DEFAULT_SCANNER_KEY, resolveScanner } from './scanners.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -15,11 +18,13 @@ const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
 const _POLYCR_PDF_URL = process.env.POLYCR_PDF_URL || `http://${new URL(POLYCR_URL).hostname}:8001`;
 const _SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
 
+// Legacy SCANNERS map — kept for the scan_document tool (uses scanimage device name strings).
+// The eSCL pipeline (scan_and_file / quick_scan / scan_and_file_async) uses SCANNER_DEVICES below.
 const SCANNERS = {
   'hp-officejet-5740': process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080',
   'canon-mf741c': 'airscan:e0:Canon MF741C',
 };
-// Default scanner
+// Default scanner (legacy — still used by scan_document)
 const DEFAULT_SCANNER = SCANNERS['canon-mf741c'];
 
 const NEXTCLOUD_URL = process.env.NEXTCLOUD_URL || 'https://nextcloud.shifting-ground.link';
@@ -1143,15 +1148,16 @@ function extractTitleSlug(text) {
 // Why: Canon MF741C returns HTTP 500 on POST /eSCL/ScanJobs if a previous job is still
 //      registered (zombie job from a crashed/killed process that skipped its finally-DELETE).
 //      This pre-flight clears any active/processing jobs so the next POST succeeds.
+//      The same behaviour applies to other eSCL scanners, so esclBase is parameterised.
 // What: GETs /eSCL/ScannerStatus, parses ALL JobUri elements regardless of job state,
 //       fires DELETE on each, waits 500ms for the printer to release the job lock, then returns.
 //       Errors are swallowed — if we can't clear, we proceed anyway and let the POST fail
 //       with a meaningful error rather than hanging here.
 // Test: Mock ScannerStatus to return XML with a JobUri, assert DELETE is called on that URI;
 //       mock ScannerStatus to return non-OK, assert function returns without throwing.
-async function clearStuckEsclJobs() {
+async function clearStuckEsclJobs(esclBase = CANON_ESCL_BASE) {
   try {
-    const statusResp = await fetch(`${CANON_ESCL_BASE}/eSCL/ScannerStatus`, {
+    const statusResp = await fetch(`${esclBase}/eSCL/ScannerStatus`, {
       signal: AbortSignal.timeout(5000),
     });
     if (!statusResp.ok) return;
@@ -1165,7 +1171,7 @@ async function clearStuckEsclJobs() {
     // DELETE each stuck job (fire-and-forget per job, but await all)
     await Promise.allSettled(
       jobUris.map((uri) => {
-        const url = uri.startsWith('http') ? uri : `${CANON_ESCL_BASE}${uri}`;
+        const url = uri.startsWith('http') ? uri : `${esclBase}${uri}`;
         return fetch(url, { method: 'DELETE', signal: AbortSignal.timeout(3000) });
       })
     );
@@ -1177,18 +1183,25 @@ async function clearStuckEsclJobs() {
   }
 }
 
-// Why: Drives a multi-page ADF scan on the Canon MF741C using the eSCL HTTP API directly,
-//      capturing both sides of each sheet (duplex) and discarding blank back pages so
-//      single-sided documents don't produce empty pages in the output PDF.
+// Why: Drives a multi-page ADF scan using the eSCL HTTP API directly, capturing both sides
+//      of each sheet (duplex) and discarding blank back pages so single-sided documents
+//      don't produce empty pages in the output PDF. Works with any eSCL-capable scanner.
 // What: Posts a ScanJob with AdfDuplex as the InputSource (Canon encodes duplex mode in the
 //       InputSource value, not as a separate element), then fetches NextDocument in a
 //       loop until 404 (ADF empty). Pages smaller than BLANK_PAGE_THRESHOLD_BYTES are
 //       deleted from disk and skipped — they are blank back sides of single-sided sheets.
+//       esclBase defaults to CANON_ESCL_BASE for backward compatibility.
 // Test: Supply a two-sheet duplex scan where sheets 1 and 2 have content only on the front.
 //       Assert four raw page files are written, two are discarded (back sides < 50 KB),
 //       and pageJpegs contains exactly two paths.
-async function scanAdfViaEscl(timestamp, colorMode, resolution, onProgress) {
-  await clearStuckEsclJobs();
+async function scanAdfViaEscl(
+  timestamp,
+  colorMode,
+  resolution,
+  onProgress,
+  esclBase = CANON_ESCL_BASE
+) {
+  await clearStuckEsclJobs(esclBase);
   const scanXml = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03"',
@@ -1212,7 +1225,7 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution, onProgress) {
   ].join('\n');
 
   // Create scan job
-  const createResp = await fetch(`${CANON_ESCL_BASE}/eSCL/ScanJobs`, {
+  const createResp = await fetch(`${esclBase}/eSCL/ScanJobs`, {
     method: 'POST',
     headers: { 'Content-Type': 'text/xml' },
     body: scanXml,
@@ -1225,12 +1238,12 @@ async function scanAdfViaEscl(timestamp, colorMode, resolution, onProgress) {
 
   const location = createResp.headers.get('location');
   if (!location) throw new Error('eSCL: no Location header in job creation response');
-  const jobUrl = location.startsWith('http') ? location : `${CANON_ESCL_BASE}${location}`;
+  const jobUrl = location.startsWith('http') ? location : `${esclBase}${location}`;
 
   const pageJpegs = [];
   try {
     for (let pageNum = 1; pageNum <= 99; pageNum++) {
-      // 90s per-page timeout — Canon can be slow to scan and compress
+      // 90s per-page timeout — scanner can be slow to scan and compress
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), 90000);
       let pageResp;
@@ -1615,7 +1628,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'scan_and_file',
       description:
-        'Start a scan job in the background. Returns a job_id immediately (NOT the final result). Full pipeline: scan → OCR → searchable PDF → auto-classify → upload. You MUST then poll get_scan_job_status with the returned job_id every 5-10 seconds until status is COMPLETED (typical: 90-180 seconds), then call get_scan_job_result to retrieve the filed document. Do NOT call this tool again before the previous scan completes — Canon scanner is a shared resource. Only `profile` is required; all other parameters have defaults.',
+        'Start a scan job in the background. Returns a job_id immediately (NOT the final result). Full pipeline: scan → OCR → searchable PDF → auto-classify → upload. You MUST then poll get_scan_job_status with the returned job_id every 5-10 seconds until status is COMPLETED (typical: 90-180 seconds), then call get_scan_job_result to retrieve the filed document. Do NOT call this tool again before the previous scan completes — the scanner is a shared resource. Only `profile` is required; all other parameters have defaults.\n\nScanner selection via the `scanner` parameter:\n  "canon" / "mf741c" / "741c" / "741" → Canon MF741C (192.168.1.141) — DEFAULT\n  "hp" / "hp 5000" / "hp5000" / "officejet" / "5740" / "5000" → HP OfficeJet 5740 (192.168.1.183:8080)\n  Omit the parameter to use the Canon (default). Phrases like "the HP", "HP 5000", "the Canon" should be mapped to the appropriate value.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1623,7 +1636,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['doc-bw', 'doc-bw-adf', 'doc-color', 'receipt', 'id-card', 'photo', 'event'],
             description:
-              'Scanning profile. doc-bw-adf = Canon ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
+              'Scanning profile. doc-bw-adf = ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
           },
           description: {
             type: 'string',
@@ -1646,9 +1659,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           scanner: {
             type: 'string',
-            enum: ['hp-officejet-5740', 'canon-mf741c'],
             description:
-              'Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). hp-officejet-5740 = HP Officejet 5740 (backup flatbed). Default: canon-mf741c',
+              'Which scanner to use. Default: "canon" (Canon MF741C, 192.168.1.141). Use "hp" for HP OfficeJet 5740 (192.168.1.183:8080). Accepted aliases — canon: "canon", "mf741c", "741c", "741"; hp: "hp", "hp 5000", "hp5000", "officejet", "5740", "5000". Unknown values return an error listing valid options.',
           },
           language: {
             type: 'string',
@@ -1663,7 +1675,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'quick_scan',
       description:
-        'Single-page quick scan using Canon MF741C ADF. Returns a job_id immediately (NOT the final result). Returns an error if ADF is empty. Zero configuration needed. Use the same polling pattern as scan_and_file: poll get_scan_job_status every 5-10 seconds until COMPLETED, then call get_scan_job_result.',
+        'Single-page quick scan via ADF — zero configuration needed. Returns a job_id immediately (NOT the final result). Returns an error if ADF is empty. Use the same polling pattern as scan_and_file: poll get_scan_job_status every 5-10 seconds until COMPLETED, then call get_scan_job_result.\n\nDefault scanner: Canon MF741C. To use the HP OfficeJet 5740 pass scanner="hp" (aliases: "hp 5000", "hp5000", "officejet", "5740"). Phrases like "the HP"/"HP 5000" → scanner="hp"; "the Canon" → scanner="canon" (or omit).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1671,13 +1683,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: "Optional hint for filename (e.g. 'verizon bill')",
           },
+          scanner: {
+            type: 'string',
+            description:
+              'Which scanner to use. Default: "canon" (Canon MF741C). Use "hp" for HP OfficeJet 5740. See scan_and_file for full alias list.',
+          },
         },
       },
     },
     {
       name: 'scan_and_file_async',
       description:
-        'Alias for scan_and_file — both return a job_id immediately and require polling. Use scan_and_file as the canonical name. Start a scan-and-file job in the background. Returns a job_id immediately (within ~1s). Poll get_scan_job_status every 5-10s until COMPLETED, then call get_scan_job_result. Only one scan may run at a time.',
+        'Alias for scan_and_file — both return a job_id immediately and require polling. Use scan_and_file as the canonical name. Start a scan-and-file job in the background. Returns a job_id immediately (within ~1s). Poll get_scan_job_status every 5-10s until COMPLETED, then call get_scan_job_result. Only one scan may run at a time.\n\nScanner selection: "canon" = Canon MF741C (default); "hp" = HP OfficeJet 5740. See scan_and_file for full alias list.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1685,7 +1702,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['doc-bw', 'doc-bw-adf', 'doc-color', 'receipt', 'id-card', 'photo', 'event'],
             description:
-              'Scanning profile. doc-bw-adf = Canon ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
+              'Scanning profile. doc-bw-adf = ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
           },
           description: {
             type: 'string',
@@ -1708,9 +1725,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           scanner: {
             type: 'string',
-            enum: ['hp-officejet-5740', 'canon-mf741c'],
             description:
-              'Scanner to use. canon-mf741c = Canon MF741C (primary, ADF+flatbed). Default: canon-mf741c',
+              'Which scanner to use. Default: "canon" (Canon MF741C). Use "hp" for HP OfficeJet 5740. See scan_and_file for full alias list.',
           },
           language: {
             type: 'string',
@@ -2550,21 +2566,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   if (name === 'scan_and_file' || name === 'quick_scan' || name === 'scan_and_file_async') {
     // Why: Executes the full scan→OCR→PDF→upload pipeline atomically so a context
     //      bootstrap reset cannot interrupt it between steps.
-    // What: Scans via scanimage, OCRs via polycr (Tesseract fallback), creates a
-    //       searchable PDF via ocrmypdf service (Tesseract fallback), uploads to
-    //       Nextcloud WebDAV, cleans up temp files, returns a summary object.
-    //       quick_scan is a zero-config alias: canon-mf741c + doc-bw-adf defaults.
+    // What: Scans via eSCL HTTP API (ADF) or scanimage (Flatbed), OCRs via vision/Tesseract,
+    //       creates a searchable PDF via ocrmypdf (Tesseract fallback), uploads to Nextcloud
+    //       WebDAV, cleans up temp files, returns a summary object.
+    //       quick_scan is a zero-config alias: canon + doc-bw-adf defaults.
     //       scan_and_file_async runs the same pipeline in the background, returning a
     //       job_id immediately. Poll with get_scan_job_status / get_scan_job_result.
-    // Test: Mock execSync for scanimage success; mock fetch for polycr and ocrmypdf;
+    //       The `scanner` parameter selects between registered devices via resolveScanner();
+    //       unknown values return a clear error listing valid options.
+    // Test: Mock execSync for scanimage success; mock fetch for eSCL and Nextcloud;
     //       assert result.success is true, result.filed_at is non-null, and temp
     //       files are deleted by the end of the call.
+
+    // Resolve scanner arg → device record (esclBase + label + key).
+    // quick_scan default is 'canon'; scan_and_file/async default is DEFAULT_SCANNER_KEY.
+    const rawScannerArg =
+      name === 'quick_scan'
+        ? (args?.scanner ?? DEFAULT_SCANNER_KEY)
+        : (args?.scanner ?? DEFAULT_SCANNER_KEY);
+
+    let resolvedDevice;
+    try {
+      resolvedDevice = resolveScanner(rawScannerArg);
+    } catch (resolveErr) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: resolveErr.message }) }],
+        isError: true,
+      };
+    }
+    const { key: scannerKey, label: scannerLabel, esclBase } = resolvedDevice;
+
     const resolvedArgs =
       name === 'quick_scan'
         ? {
             profile: 'doc-bw-adf',
-            scanner: 'canon-mf741c',
-            ...(args.description ? { description: args.description } : {}),
+            ...(args?.description ? { description: args.description } : {}),
           }
         : args;
     const {
@@ -2573,16 +2609,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       nextcloud_path: ncPathOverride,
       filename: filenameOverride,
       separate_pages = false,
-      scanner = 'canon-mf741c',
       language,
     } = resolvedArgs;
-    const deviceName = SCANNERS[scanner] || DEFAULT_SCANNER;
+    // scanner label used in result metadata (replaces the old 'scanner' string variable)
+    const scanner = scannerLabel;
+
+    // Resolve scanimage device name for Flatbed path (legacy SCANNERS map, keyed by canonical key)
+    const legacyScannerKey =
+      scannerKey === 'canon' ? 'canon-mf741c' : scannerKey === 'hp' ? 'hp-officejet-5740' : null;
+    const deviceName = (legacyScannerKey && SCANNERS[legacyScannerKey]) || DEFAULT_SCANNER;
+
     const params = PROFILE_PARAMS[profile];
     if (!params) throw new Error(`Unknown profile: ${profile}`);
 
-    // Canon MF741C ADF only accepts Color mode (Gray returns "Invalid argument")
+    // Canon MF741C ADF only accepts Color mode (Gray returns "Invalid argument").
+    // Apply the same override for any Canon device key.
     let scanMode = params.mode;
-    if (scanner === 'canon-mf741c' && params.source === 'ADF') {
+    if (scannerKey === 'canon' && params.source === 'ADF') {
       scanMode = 'Color';
     }
 
@@ -2745,11 +2788,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             progress: { stage: 'adf_starting', total_pages: null },
           });
 
-        const pageJpegs = await scanAdfViaEscl(timestamp, scanMode, 300, (count, msg) => {
-          sendProgress(count, 99, msg);
-          if (jobId)
-            updateScanJob(jobId, { progress: { stage: 'adf_fetching', current_page: count } });
-        });
+        const pageJpegs = await scanAdfViaEscl(
+          timestamp,
+          scanMode,
+          300,
+          (count, msg) => {
+            sendProgress(count, 99, msg);
+            if (jobId)
+              updateScanJob(jobId, { progress: { stage: 'adf_fetching', current_page: count } });
+          },
+          esclBase
+        );
         for (const f of pageJpegs) allTempFiles.push(f);
 
         if (pageJpegs.length === 0) {

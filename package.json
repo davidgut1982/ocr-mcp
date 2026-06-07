@@ -4,7 +4,7 @@
   "description": "MCP server for OCR — multi-engine via polycr (tesseract/easyocr/doctr) with local Tesseract fallback, image preprocessing, and event detail extraction",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/resolveScanner.test.mjs"
   },
   "keywords": [],
   "author": "david-gutowsky",
