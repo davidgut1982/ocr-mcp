@@ -554,6 +554,17 @@ function classifyDocument(text) {
 
 // --- scan_and_file helpers ---
 
+// Default scan profile — used when `profile` is omitted or empty.
+// Why doc-bw-adf: The ADF (automatic document feeder) black-and-white profile is the
+// most robust general-purpose default because (a) nearly all document scans use the
+// ADF rather than the flatbed, (b) B&W/grayscale JPEG output is smaller and faster
+// to OCR than colour, and (c) it matches the quick_scan shortcut which already
+// hard-codes this profile. ADF is preferred over flatbed for reliability: a flatbed
+// scan requires the user to physically place the document and close the lid, whereas
+// the ADF just needs a document in the feeder — matching the typical "scan document"
+// intent. Override via DEFAULT_SCAN_PROFILE env var for non-ADF deployments.
+const DEFAULT_SCAN_PROFILE = process.env.DEFAULT_SCAN_PROFILE || 'doc-bw-adf';
+
 // Why: Maps profile names to scanimage parameters so the atomic pipeline tool
 //      doesn't need a large switch statement at call-site.
 // What: Returns { mode, source, format } for a given profile string.
@@ -1628,7 +1639,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'scan_and_file',
       description:
-        'Primary scan-and-file tool: scans the selected scanner\'s ADF → OCR → searchable PDF → auto-classify → upload to Nextcloud. Use this for any "scan and file" / "scan the document on the <scanner>" request. This is the full synchronous pipeline (distinct from the low-level scan_document, which only captures one raw page). It starts the job and returns a job_id immediately (NOT the final result); you MUST then poll get_scan_job_status with the returned job_id every 5-10 seconds until status is COMPLETED (typical: 90-180 seconds), then call get_scan_job_result to retrieve the filed document. Do NOT call this tool again before the previous scan completes — the scanner is a shared resource. Only `profile` is required; all other parameters have defaults.\n\nScanner selection via the `scanner` parameter:\n  "canon" / "mf741c" / "741c" / "741" → Canon MF741C (192.168.1.141) — DEFAULT\n  "hp" / "hp 5000" / "hp5000" / "officejet" / "5740" / "5000" → HP OfficeJet 5740 (192.168.1.183:8080)\n  Omit the parameter to use the Canon (default). Phrases like "the HP", "HP 5000", "the Canon" should be mapped to the appropriate value.',
+        'Primary scan-and-file tool: scans the selected scanner\'s ADF → OCR → searchable PDF → auto-classify → upload to Nextcloud. Use this for any "scan and file" / "scan the document on the <scanner>" request. This is the full synchronous pipeline (distinct from the low-level scan_document, which only captures one raw page). It starts the job and returns a job_id immediately (NOT the final result); you MUST then poll get_scan_job_status with the returned job_id every 5-10 seconds until status is COMPLETED (typical: 90-180 seconds), then call get_scan_job_result to retrieve the filed document. Do NOT call this tool again before the previous scan completes — the scanner is a shared resource. All parameters are optional and have sensible defaults.\n\nScanner selection via the `scanner` parameter:\n  "canon" / "mf741c" / "741c" / "741" → Canon MF741C (192.168.1.141) — DEFAULT\n  "hp" / "hp 5000" / "hp5000" / "officejet" / "5740" / "5000" → HP OfficeJet 5740 (192.168.1.183:8080)\n  Omit the parameter to use the Canon (default). Phrases like "the HP", "HP 5000", "the Canon" should be mapped to the appropriate value.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1636,7 +1647,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['doc-bw', 'doc-bw-adf', 'doc-color', 'receipt', 'id-card', 'photo', 'event'],
             description:
-              'Scanning profile. doc-bw-adf = ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
+              'Scanning profile. Optional — defaults to "doc-bw-adf" (ADF feeder B&W) when omitted. doc-bw-adf = ADF feeder B&W (default). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
           },
           description: {
             type: 'string',
@@ -1669,7 +1680,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "OCR language for text recognition. 'eng' = English (default), 'lav' = Latvian. Threads through to Tesseract and ocrmypdf.",
           },
         },
-        required: ['profile'],
       },
     },
     {
@@ -1702,7 +1712,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['doc-bw', 'doc-bw-adf', 'doc-color', 'receipt', 'id-card', 'photo', 'event'],
             description:
-              'Scanning profile. doc-bw-adf = ADF feeder B&W (default for multi-page). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
+              'Scanning profile. Optional — defaults to "doc-bw-adf" (ADF feeder B&W) when omitted. doc-bw-adf = ADF feeder B&W (default). doc-bw = flatbed B&W single page. doc-color = flatbed color. receipt = receipt flatbed. id-card = ID/insurance card flatbed. photo = photo flatbed. event = event flyer flatbed.',
           },
           description: {
             type: 'string',
@@ -1734,7 +1744,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: "OCR language. 'eng' = English (default), 'lav' = Latvian.",
           },
         },
-        required: ['profile'],
       },
     },
     {
@@ -2604,7 +2613,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           }
         : args;
     const {
-      profile,
+      profile: profileArg,
       description,
       nextcloud_path: ncPathOverride,
       filename: filenameOverride,
@@ -2619,8 +2628,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       scannerKey === 'canon' ? 'canon-mf741c' : scannerKey === 'hp' ? 'hp-officejet-5740' : null;
     const deviceName = (legacyScannerKey && SCANNERS[legacyScannerKey]) || DEFAULT_SCANNER;
 
+    // Why: profile is now optional — fall back to DEFAULT_SCAN_PROFILE when omitted or empty
+    //      so callers like the Telegram agent can do scan_and_file({scanner:"hp"}) without
+    //      specifying a profile. Explicit invalid profiles still produce a clear error.
+    // What: If profileArg is undefined/null/empty-string, substitute DEFAULT_SCAN_PROFILE.
+    //       Then look it up in PROFILE_PARAMS; if it still misses (explicit bad value), throw
+    //       with the valid profile list so the caller knows what to use.
+    //       The resolved value is declared as `profile` so all downstream closure references
+    //       (classifyDocumentForFiling, processSinglePage comparisons, result metadata) work
+    //       without any changes.
+    // Test: profileArg=undefined → profile===DEFAULT_SCAN_PROFILE, params is defined.
+    //       profileArg='doc-color' → profile==='doc-color', params is defined.
+    //       profileArg='bad-value' → throws "Unknown profile: bad-value (valid: ...)".
+    const profile =
+      profileArg && typeof profileArg === 'string' && profileArg.trim()
+        ? profileArg.trim()
+        : DEFAULT_SCAN_PROFILE;
     const params = PROFILE_PARAMS[profile];
-    if (!params) throw new Error(`Unknown profile: ${profile}`);
+    if (!params) {
+      throw new Error(
+        `Unknown profile: ${profile} (valid: ${Object.keys(PROFILE_PARAMS).join(', ')})`
+      );
+    }
 
     // Canon MF741C ADF only accepts Color mode (Gray returns "Invalid argument").
     // Apply the same override for any Canon device key.
